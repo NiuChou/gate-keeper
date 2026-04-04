@@ -14,7 +14,7 @@ layer1:
   port_chain: true
   namespace_consistency: true
 layer2:
-  deployment_name_match: true
+  secret_name: "my-secret"  deployment_name_match: true
   image_name_match: true
   secret_key_match: true
 layer3:

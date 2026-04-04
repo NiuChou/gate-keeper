@@ -76,7 +76,7 @@ Each layer must pass before the next runs. Any failure blocks deployment.
 gate-keeper init                # 检测项目类型，生成 .gatekeeper.yaml
 gate-keeper run                 # 运行检查（默认全部三层）
 gate-keeper run --layer=1       # 仅 Layer 1
-gate-keeper run --layer=2       # Layer 1 + 2
+gate-keeper run --layer=2       # Layer 1 + 2 (累积 / cumulative)
 gate-keeper run --ci            # CI 模式（无颜色，JSON 输出）
 gate-keeper audit               # 查看审计日志
 gate-keeper audit --last=10     # 最近 10 条

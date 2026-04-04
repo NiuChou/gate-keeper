@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-svc
+  namespace: production
+spec:
+  template:
+    spec:
+      containers:
+        - name: bad-svc
+          image: registry.example.com/bad-svc:latest
+          ports:
+            - containerPort: 8080
+      envFrom:
+        - secretRef:
+            name: my-secret

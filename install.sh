@@ -6,6 +6,16 @@ BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
 
+# Permission check
+if [ ! -w "${INSTALL_DIR%/*}" ] 2>/dev/null || [ ! -w "${BIN_DIR}" ] 2>/dev/null; then
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Permission denied for $INSTALL_DIR or $BIN_DIR"
+    echo "Try: sudo bash install.sh"
+    echo "Or:  INSTALL_DIR=~/.local/lib/gate-keeper BIN_DIR=~/.local/bin bash install.sh"
+    exit 1
+  fi
+fi
+
 echo "Installing gate-keeper..."
 if command -v git >/dev/null 2>&1; then
   git clone --depth 1 "https://github.com/${REPO}.git" "$TMP_DIR/gk" 2>/dev/null

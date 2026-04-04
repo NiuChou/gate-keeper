@@ -13,19 +13,41 @@ inputs:
 outputs:
   passed:
     description: 'Number of passed checks'
+    value: ${{ steps.run.outputs.passed }}
   failed:
     description: 'Number of failed checks'
+    value: ${{ steps.run.outputs.failed }}
   verdict:
     description: 'PASSED or BLOCKED'
+    value: ${{ steps.run.outputs.verdict }}
 runs:
   using: 'composite'
   steps:
     - name: Run Gate Keeper
+      id: run
       shell: bash
+      env:
+        GK_LAYER: ${{ inputs.layer }}
+        GK_CONFIG: ${{ inputs.config }}
       run: |
         GK_DIR="${{ github.action_path }}"
         chmod +x "${GK_DIR}/../bin/gate-keeper"
+        
+        # Run and capture exit code
+        set +e
         "${GK_DIR}/../bin/gate-keeper" run \
-          --layer=${{ inputs.layer }} \
-          --config=${{ inputs.config }} \
+          --layer="${GK_LAYER}" \
+          --config="${GK_CONFIG}" \
           --ci
+        EXIT_CODE=$?
+        set -e
+        
+        # Parse audit log for outputs
+        AUDIT_FILE=$(ls -t .gate-audit/*.json 2>/dev/null | head -1)
+        if [ -n "$AUDIT_FILE" ]; then
+          echo "passed=$(grep '"passed"' "$AUDIT_FILE" | sed 's/.*: *//' | sed 's/,.*//')" >> "$GITHUB_OUTPUT"
+          echo "failed=$(grep '"failed"' "$AUDIT_FILE" | sed 's/.*: *//' | sed 's/,.*//')" >> "$GITHUB_OUTPUT"
+          echo "verdict=$(grep '"verdict"' "$AUDIT_FILE" | sed 's/.*: *"//' | sed 's/".*//')" >> "$GITHUB_OUTPUT"
+        fi
+        
+        exit $EXIT_CODE
