@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# gate-keeper — Three-layer automated deployment gatekeeper
+# https://github.com/NiuChou/gate-keeper
+set -euo pipefail
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+
+source "${LIB_DIR}/core.sh"
+source "${LIB_DIR}/output.sh"
+source "${LIB_DIR}/layer1.sh"
+source "${LIB_DIR}/layer2.sh"
+source "${LIB_DIR}/layer3.sh"
+
+COMMAND="${1:-run}"
+shift 2>/dev/null || true
+
+case "$COMMAND" in
+  init)    gk_init "$@" ;;
+  run)     gk_run "$@" ;;
+  audit)   gk_audit "$@" ;;
+  doctor)  gk_doctor "$@" ;;
+  version) echo "gate-keeper v${VERSION}" ;;
+  help|--help|-h)
+    echo "gate-keeper v${VERSION} — Three-layer deployment gatekeeper"
+    echo ""
+    echo "Commands:"
+    echo "  init      Detect project type, generate .gatekeeper.yaml"
+    echo "  run       Execute checks (default)"
+    echo "  audit     View audit log history"
+    echo "  doctor    Self-check: verify checks are intact"
+    echo "  version   Show version"
+    echo ""
+    echo "Options for 'run':"
+    echo "  --layer=1|2|3|all   Check layer (default: all)"
+    echo "  --config=PATH       Config file (default: .gatekeeper.yaml)"
+    echo "  --format=text|json  Output format (default: text)"
+    echo "  --ci                CI mode: strict, no colors"
+    ;;
+  *)
+    echo "Unknown command: $COMMAND"
+    echo "Run 'gate-keeper help' for usage"
+    exit 1
+    ;;
+esac

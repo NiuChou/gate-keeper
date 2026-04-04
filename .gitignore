@@ -1,0 +1,3 @@
+.gate-audit/
+*.bak
+.DS_Store

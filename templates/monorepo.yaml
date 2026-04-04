@@ -1,0 +1,29 @@
+version: 1
+project: my-project
+namespace: production
+layer1:
+  go_work: true
+  shell_syntax: true
+  python_packaging: true
+  dockerfile_copy: true
+  dockerfile_antipatterns: true
+  secretref_ban: true
+  deprecated_refs:
+    enabled: true
+    patterns: []
+  port_chain: true
+  namespace_consistency: true
+layer2:
+  deployment_name_match: true
+  image_name_match: true
+  secret_key_match: true
+layer3:
+  healthz: true
+  pod_status: true
+  load_test: true
+audit:
+  dir: .gate-audit/
+  retain_days: 30
+selfcheck:
+  min_layer1_checks: 5
+  min_layer2_checks: 3

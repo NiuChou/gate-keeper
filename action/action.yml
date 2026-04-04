@@ -1,0 +1,31 @@
+name: 'Gate Keeper'
+description: 'Three-layer automated deployment gatekeeper'
+branding:
+  icon: 'shield'
+  color: 'green'
+inputs:
+  layer:
+    description: 'Check layer (1|2|3|all)'
+    default: '1'
+  config:
+    description: 'Config file path'
+    default: '.gatekeeper.yaml'
+outputs:
+  passed:
+    description: 'Number of passed checks'
+  failed:
+    description: 'Number of failed checks'
+  verdict:
+    description: 'PASSED or BLOCKED'
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Gate Keeper
+      shell: bash
+      run: |
+        GK_DIR="${{ github.action_path }}"
+        chmod +x "${GK_DIR}/../bin/gate-keeper"
+        "${GK_DIR}/../bin/gate-keeper" run \
+          --layer=${{ inputs.layer }} \
+          --config=${{ inputs.config }} \
+          --ci

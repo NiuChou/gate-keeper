@@ -1,0 +1,28 @@
+version: 1
+project: my-project
+namespace: default
+layer1:
+  go_work: false
+  shell_syntax: true
+  python_packaging: false
+  dockerfile_copy: true
+  dockerfile_antipatterns: true
+  secretref_ban: false
+  deprecated_refs:
+    enabled: false
+  port_chain: false
+  namespace_consistency: false
+layer2:
+  deployment_name_match: false
+  image_name_match: false
+  secret_key_match: false
+layer3:
+  healthz: false
+  pod_status: false
+  load_test: false
+audit:
+  dir: .gate-audit/
+  retain_days: 30
+selfcheck:
+  min_layer1_checks: 2
+  min_layer2_checks: 0
