@@ -1,6 +1,6 @@
 # Gate Keeper
 
-三层自动化部署守门员——构建前静态检查、部署前集群校验、部署后运行时验证，配置驱动、审计留痕、失败即阻止。
+一套三层自动化部署校验系统——构建前静态检查、部署前集群校验、部署后运行时验证，配置驱动、审计留痕、失败即阻止。
 
 A three-layer automated deployment gatekeeper — static checks before build, cluster validation before deploy, runtime verification after deploy — config-driven, audit-logged, fail-to-block.
 
