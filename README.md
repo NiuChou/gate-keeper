@@ -26,19 +26,19 @@ gate-keeper run --layer=all    # 全部三层 / All layers
 
 | 层级 / Layer | 时机 / When | 检查内容 / What | 依赖 / Requires |
 |---|---|---|---|
-| **Layer 1: 静态检查** | 构建前 / Before build | go.work、Dockerfile、secretRef 禁用、端口链、namespace 一致性 | 无 / Nothing |
+| **Layer 1: 静态检查** | 构建前 / Before build | go.work、Dockerfile、secretRef 禁用、端口链、namespace 一致性 + 自定义检查 | 无 / Nothing |
 | **Layer 2: 集群校验** | 部署前 / Before deploy | Deployment 名匹配、镜像名匹配、Secret key 匹配 | kubectl |
 | **Layer 3: 运行时验证** | 部署后 / After deploy | 健康检查、Pod 状态、负载测试 | kubectl |
 
-每层全部通过才放行下一层。任一失败即阻止部署。
+每层全部通过才放行下一层。任一 critical 失败即阻止部署，warning 仅告警不阻止。
 
-Each layer must pass before the next runs. Any failure blocks deployment.
+Each layer must pass before the next runs. Any critical failure blocks deployment; warnings alert but don't block.
 
 ---
 
 ## 检查项清单 / Check List
 
-### Layer 1: 静态检查（9 项）
+### Layer 1: 静态检查（9 项 + 自定义）
 
 | ID | 检查 / Check | 说明 / Description |
 |---|---|---|
@@ -47,10 +47,11 @@ Each layer must pass before the next runs. Any failure blocks deployment.
 | C | Python 打包 | 无重复 setup.py + pyproject.toml |
 | D | Dockerfile COPY | COPY 源路径存在 |
 | E | Dockerfile 反模式 | 无 -e 安装、无 -dev 包 |
-| F | secretRef 禁用 | 禁止 secretRef 注入全部 key，必须逐个 secretKeyRef |
-| G | 废弃组件引用 | 检测已废弃的组件名（可自定义） |
+| F | secretRef 禁用 | 禁止 secretRef 注入全部 key，必须逐个 secretKeyRef（支持 `exclude_pattern`） |
+| G | 废弃组件引用 | 检测已废弃的组件名（可自定义 patterns） |
 | H | 端口链一致性 | containerPort = probePort = targetPort |
-| I | namespace 一致性 | 所有 YAML 的 namespace 必须一致 |
+| I | namespace 一致性 | 所有 YAML 的 namespace 必须一致（支持 `expect` 配置） |
+| * | 自定义检查 | 通过 `custom_checks` 配置 pattern 或 command |
 
 ### Layer 2: 集群校验（3 项）
 
@@ -68,6 +69,13 @@ Each layer must pass before the next runs. Any failure blocks deployment.
 | N | 异常 Pod 检测 | 无 CrashLoopBackOff / ImagePullBackOff |
 | O | 负载测试 | k6 轻量级 smoke test（可选） |
 
+### 监督层 / Supervision
+
+| ID | 检查 / Check | 说明 / Description |
+|---|---|---|
+| S-1 | 篡改检测 | SHA256 hash 验证 gate-keeper 文件完整性 |
+| — | 绕过检测 | Deployment 缺少 `gate-keeper-run-id` annotation 即告警 |
+
 ---
 
 ## 命令 / Commands
@@ -80,9 +88,61 @@ gate-keeper run --layer=2       # Layer 1 + 2 (累积 / cumulative)
 gate-keeper run --ci            # CI 模式（无颜色，JSON 输出）
 gate-keeper audit               # 查看审计日志
 gate-keeper audit --last=10     # 最近 10 条
-gate-keeper doctor              # 自检：配置、依赖、完整性
+gate-keeper doctor              # 自检：配置、依赖、完整性、hash 验证
+gate-keeper add                 # 添加自定义检查项到配置
+gate-keeper stamp               # 生成 SHA256 hash 文件（篡改检测基线）
+gate-keeper stamp --verify      # 验证文件完整性
 gate-keeper version             # 版本号
 gate-keeper help                # 帮助
+```
+
+### gate-keeper add
+
+动态添加自定义 grep 检查项到 `.gatekeeper.yaml`：
+
+Dynamically add custom grep-based checks to `.gatekeeper.yaml`:
+
+```bash
+gate-keeper add \
+  --id=no_console_log \
+  --pattern="console.log" \
+  --paths="src/**/*.ts" \
+  --severity=warning \
+  --description="Ban console.log in source"
+```
+
+### gate-keeper stamp
+
+生成 gate-keeper 脚本文件的 SHA256 hash 基线，用于 CI 中检测篡改：
+
+Generate SHA256 hash baseline for tamper detection in CI:
+
+```bash
+gate-keeper stamp               # 生成 .gate-keeper.sha256
+gate-keeper stamp --verify      # 验证完整性
+```
+
+---
+
+## Severity 分级 / Severity Levels
+
+每个检查项可配置 `severity`：
+
+Each check can be configured with `severity`:
+
+| 级别 / Level | 行为 / Behavior |
+|---|---|
+| `critical`（默认） | 失败 → 阻止部署 (BLOCKED) |
+| `warning` | 失败 → 仅警告 (WARNED)，不阻止 |
+
+```yaml
+layer1:
+  secretref_ban:
+    enabled: true
+    severity: critical       # 失败即阻止
+  shell_syntax:
+    enabled: true
+    severity: warning        # 失败仅警告
 ```
 
 ---
@@ -108,6 +168,10 @@ jobs:
           layer: 2
 ```
 
+Action 内置完整性验证：若仓库包含 `.gate-keeper.sha256`，会在运行前自动验证文件未被篡改。
+
+Built-in integrity check: if `.gate-keeper.sha256` exists, files are verified before execution.
+
 ---
 
 ## Claude Code Skill
@@ -132,12 +196,32 @@ project: my-project
 namespace: production
 
 layer1:
-  secretref_ban: true
-  port_chain: true
-  namespace_consistency: true
+  secretref_ban:
+    enabled: true
+    severity: critical
+    exclude_pattern: "secretKeyRef"
+  port_chain:
+    enabled: true
+    severity: critical
+  namespace_consistency:
+    enabled: true
+    severity: critical
+    expect: "production"
   deprecated_refs:
     enabled: true
+    severity: warning
     patterns: ["minio", "kafka"]
+
+  # 自定义检查 / Custom checks
+  custom_checks:
+    - id: no_console_log
+      pattern: "console.log"
+      paths: "src/**/*.ts"
+      severity: warning
+      description: "Ban console.log"
+    - id: lint_check
+      command: "npm run lint --silent"
+      description: "Run linter"
 
 layer2:
   deployment_name_match: true
@@ -173,9 +257,12 @@ Every run generates a JSON audit log in `.gate-audit/`:
   "project": "perseworks",
   "passed": 9,
   "failed": 0,
-  "verdict": "PASSED"
+  "warnings": 2,
+  "verdict": "WARNED"
 }
 ```
+
+Verdict 取值 / Verdict values: `PASSED` | `WARNED` | `BLOCKED`
 
 ---
 
@@ -183,7 +270,7 @@ Every run generates a JSON audit log in `.gate-audit/`:
 
 ```
 ============================================
-  Gate Keeper v1.0.0 · perseworks
+  Gate Keeper v1.1.0 · perseworks
 ============================================
 
 ── Layer 1: Static Checks ──
@@ -194,15 +281,30 @@ Every run generates a JSON audit log in `.gate-audit/`:
   ✓ [D] Dockerfile COPY paths            PASS  (23ms)
   ✓ [E] Dockerfile anti-patterns         PASS  (15ms)
   ✓ [F] secretRef ban                    PASS  (6ms)
-  ✓ [G] Deprecated component refs        PASS  (8ms)
+  ⚠ [G] Deprecated component refs        WARN  (8ms)
   ✓ [H] Port chain consistency           PASS  (31ms)
   ✓ [I] Namespace consistency            PASS  (5ms)
 
 ============================================
-  PASSED: 9/9 checks (153ms)
+  PASSED: 8/9 checks, 1 warning(s) (153ms)
   Audit: .gate-audit/2026-04-04T18-30-00Z-13c652a.json
 ============================================
 ```
+
+---
+
+## 监督流 / Supervision
+
+Gate Keeper 包含自监督机制，防止被绕过或篡改：
+
+Gate Keeper includes self-supervision to prevent bypass or tampering:
+
+| 机制 / Mechanism | 说明 / Description |
+|---|---|
+| **篡改检测** | `gate-keeper stamp` 生成 SHA256 hash，CI 中 `stamp --verify` 验证 |
+| **绕过检测** | 成功运行后自动为 Deployment 打上 `gate-keeper-run-id` annotation |
+| **自检** | `gate-keeper doctor` 验证配置、依赖、hash 完整性 |
+| **审计留痕** | 每次运行生成 JSON 审计日志，不可回避 |
 
 ---
 

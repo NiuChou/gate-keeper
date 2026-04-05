@@ -60,7 +60,7 @@ echo ""
 echo "── CLI Basics ──"
 assert_pass "version command" "$PROJECT_DIR/bin/gate-keeper" version
 assert_pass "help command" "$PROJECT_DIR/bin/gate-keeper" help
-assert_contains "version output" "v1.0.0" "$PROJECT_DIR/bin/gate-keeper" version
+assert_contains "version output" "v1.1.0" "$PROJECT_DIR/bin/gate-keeper" version
 
 # --- Test: Init ---
 echo ""
