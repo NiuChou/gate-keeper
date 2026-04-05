@@ -50,6 +50,36 @@ assert_contains() {
   fi
 }
 
+# Assert command does NOT exit with code 1 (allows 0 or 2)
+assert_not_blocked() {
+  local name="$1"
+  shift
+  local rc=0
+  "$@" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ne 1 ]; then
+    printf "  ${GREEN}✓${RESET} %s (exit %d)\n" "$name" "$rc"
+    ((PASSED++)) || true
+  else
+    printf "  ${RED}✗${RESET} %s (exit 1 = blocked)\n" "$name"
+    ((FAILED++)) || true
+  fi
+}
+
+# Assert command exits with specific code
+assert_exit() {
+  local name="$1" expected_code="$2"
+  shift 2
+  local rc=0
+  "$@" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq "$expected_code" ]; then
+    printf "  ${GREEN}✓${RESET} %s (exit %d)\n" "$name" "$rc"
+    ((PASSED++)) || true
+  else
+    printf "  ${RED}✗${RESET} %s (expected exit %d, got %d)\n" "$name" "$expected_code" "$rc"
+    ((FAILED++)) || true
+  fi
+}
+
 echo ""
 echo "============================================"
 echo "  Gate Keeper Test Suite"
@@ -60,7 +90,7 @@ echo ""
 echo "── CLI Basics ──"
 assert_pass "version command" "$PROJECT_DIR/bin/gate-keeper" version
 assert_pass "help command" "$PROJECT_DIR/bin/gate-keeper" help
-assert_contains "version output" "v1.2.0" "$PROJECT_DIR/bin/gate-keeper" version
+assert_contains "version output" "v2.0.0" "$PROJECT_DIR/bin/gate-keeper" version
 
 # --- Test: Init ---
 echo ""
@@ -131,7 +161,7 @@ layer1:
   port_chain: false
   deprecated_refs: false
 YML
-assert_pass "warning-severity failure exits 0" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+assert_not_blocked "warning-severity failure does not block" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
 rm -f .gatekeeper.yaml
 
 # --- Test: Severity — critical blocks ---
@@ -181,9 +211,9 @@ cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
 sed -i.bak 's/my-project/test-project/' .gatekeeper.yaml && rm -f .gatekeeper.yaml.bak
 
 assert_pass "add creates custom check" \
-  "$PROJECT_DIR/bin/gate-keeper" add --id=no_console_log --pattern="console.log" --paths="."
+  "$PROJECT_DIR/bin/gate-keeper" add --id=no_console_log --pattern="console.log" --paths="src"
 assert_contains "add confirms success" "no_debugger" \
-  "$PROJECT_DIR/bin/gate-keeper" add --id=no_debugger --pattern="debugger;" --paths="." --severity=warning --description="Ban debugger"
+  "$PROJECT_DIR/bin/gate-keeper" add --id=no_debugger --pattern="debugger;" --paths="src" --severity=warning --description="Ban debugger"
 assert_fail "add rejects duplicate id" \
   "$PROJECT_DIR/bin/gate-keeper" add --id=no_console_log --pattern="console.log" --paths="."
 assert_fail "add requires --id" \
@@ -540,6 +570,482 @@ YML
 
 assert_contains "audit --diff shows changes" "Diff:" "$PROJECT_DIR/bin/gate-keeper" audit --diff
 rm -rf .gate-audit .gatekeeper.yaml
+
+# --- Test: Drift check — global mode (PASS: both pattern and requires found) ---
+echo ""
+echo "── Drift: global mode ──"
+cd "$FIXTURES_DIR/good-project"
+mkdir -p drift_test
+echo "func DefineRLSPolicy() {}" > drift_test/define.go
+echo "ActivateRLS(db)" > drift_test/activate.go
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: rls_activation
+    pattern: "DefineRLSPolicy"
+    paths: "drift_test"
+    requires: "ActivateRLS"
+    requires_paths: "drift_test"
+    severity: critical
+    fix_hint: "Call ActivateRLS() in main.go"
+YML
+
+assert_pass "drift global: both found = PASS" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Now remove the activation call — should FAIL
+rm drift_test/activate.go
+assert_fail "drift global: defined but not called = FAIL" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf drift_test .gatekeeper.yaml .gate-audit
+
+# --- Test: Drift check — per_file mode ---
+echo ""
+echo "── Drift: per_file mode ──"
+cd "$FIXTURES_DIR/good-project"
+mkdir -p drift_pf
+
+# File with both pattern and requires → PASS
+echo -e "func HandleRequest() {\n  ParseAccessToken(r)\n}" > drift_pf/handler_a.go
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: access_token_check
+    pattern: "func Handle"
+    paths: "drift_pf"
+    requires: "ParseAccessToken"
+    drift_mode: per_file
+    severity: critical
+    fix_hint: "Add ParseAccessToken call to handler"
+YML
+
+assert_pass "drift per_file: both in same file = PASS" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Add a second file WITHOUT requires → FAIL
+echo "func HandleAdmin() { /* no auth */ }" > drift_pf/handler_b.go
+assert_fail "drift per_file: missing requires in file = FAIL" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf drift_pf .gatekeeper.yaml .gate-audit
+
+# --- Test: Drift check — commented mode ---
+echo ""
+echo "── Drift: commented mode ──"
+cd "$FIXTURES_DIR/good-project"
+mkdir -p drift_cm
+
+# Active code → PASS (not drifted)
+echo "const auth = useAuth();" > drift_cm/app.tsx
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: frontend_auth
+    pattern: "useAuth"
+    paths: "drift_cm"
+    drift_mode: commented
+    severity: critical
+    fix_hint: "Uncomment auth code — it was disabled."
+YML
+
+assert_pass "drift commented: active code = PASS" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Comment it out → FAIL
+echo "// const auth = useAuth();" > drift_cm/app.tsx
+assert_fail "drift commented: only in comments = FAIL" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf drift_cm .gatekeeper.yaml .gate-audit
+
+# --- Test: Drift check — pattern not found at all (skip, no drift) ---
+echo ""
+echo "── Drift: pattern absent ──"
+cd "$FIXTURES_DIR/good-project"
+mkdir -p drift_skip
+echo "nothing here" > drift_skip/clean.go
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: rls_absent
+    pattern: "func EnableRLS"
+    paths: "drift_skip"
+    requires: "EnableRLS()"
+    severity: critical
+YML
+
+assert_pass "drift: pattern absent = PASS (nothing to check)" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf drift_skip .gatekeeper.yaml .gate-audit
+
+# --- Test: must_match — pattern present = PASS ---
+echo ""
+echo "── must_match: pattern present ──"
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: must_have_greet
+    must_match: "function greet"
+    paths: "src"
+    severity: critical
+YML
+assert_pass "must_match: pattern found = PASS" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: must_match — pattern absent = FAIL ---
+echo ""
+echo "── must_match: pattern absent ──"
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: must_have_missing
+    must_match: "THIS_PATTERN_DOES_NOT_EXIST"
+    paths: "src"
+    severity: critical
+    fix_hint: "Add the required pattern"
+YML
+assert_fail "must_match: pattern missing = FAIL" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+assert_contains "must_match: shows fix_hint" "Fix:" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: must_match — warning severity does not block ---
+echo ""
+echo "── must_match: warning severity ──"
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: must_have_optional
+    must_match: "NONEXISTENT_PATTERN"
+    paths: "src"
+    severity: warning
+YML
+assert_not_blocked "must_match: warning severity does not block" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: must_match_count — count validation ---
+echo ""
+echo "── must_match_count ──"
+cd "$FIXTURES_DIR/good-project"
+mkdir -p mm_test
+echo -e "healthcheck: test1\nhealthcheck: test2\nhealthcheck: test3" > mm_test/compose.yml
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: enough_healthchecks
+    must_match: "healthcheck:"
+    must_match_count: 3
+    paths: "mm_test"
+    severity: critical
+YML
+assert_pass "must_match_count: 3 found, need 3 = PASS" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Need 5 but only have 3 → FAIL
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: need_more_healthchecks
+    must_match: "healthcheck:"
+    must_match_count: 5
+    paths: "mm_test"
+    severity: critical
+YML
+assert_fail "must_match_count: 3 found, need 5 = FAIL" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf mm_test .gatekeeper.yaml .gate-audit
+
+# ═══════════════════════════════════════════
+# v2.0 New Feature Tests
+# ═══════════════════════════════════════════
+
+# --- Test: Four-level severity (high, info) ---
+echo ""
+echo "── v2.0: Four-level Severity ──"
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: high_sev
+    pattern: "function greet"
+    paths: "src"
+    severity: high
+YML
+assert_fail "high-severity failure blocks" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: info_sev
+    pattern: "function greet"
+    paths: "src"
+    severity: info
+YML
+assert_pass "info-severity does not block" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: --fail-on threshold ---
+echo ""
+echo "── v2.0: --fail-on Threshold ──"
+cd "$FIXTURES_DIR/bad-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: production
+layer1:
+  secretref_ban:
+    enabled: true
+    severity: critical
+  namespace_consistency: false
+  port_chain: false
+  deprecated_refs: false
+YML
+assert_fail "fail-on=critical blocks on critical" "$PROJECT_DIR/bin/gate-keeper" run --layer=1 --fail-on=critical
+assert_not_blocked "fail-on=none never blocks" "$PROJECT_DIR/bin/gate-keeper" run --layer=1 --fail-on=none
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: Exit code semantics ---
+echo ""
+echo "── v2.0: Exit Code Semantics ──"
+cd "$FIXTURES_DIR/good-project"
+
+# All pass → exit 0
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+YML
+assert_exit "all pass = exit 0" 0 "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Warning only → exit 2
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: warn_test
+    pattern: "function greet"
+    paths: "src"
+    severity: warning
+YML
+assert_exit "warning only = exit 2" 2 "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Critical fail → exit 1
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: crit_test
+    pattern: "function greet"
+    paths: "src"
+    severity: critical
+YML
+assert_exit "critical fail = exit 1" 1 "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: SARIF output ---
+echo ""
+echo "── v2.0: SARIF Output ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+local_output=$("$PROJECT_DIR/bin/gate-keeper" run --layer=1 --format=sarif 2>&1 || true)
+assert_contains "sarif has schema" '\$schema' echo "$local_output"
+assert_contains "sarif has gate-keeper tool" 'gate-keeper' echo "$local_output"
+assert_contains "sarif has results" 'results' echo "$local_output"
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: JUnit output ---
+echo ""
+echo "── v2.0: JUnit Output ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+local_output=$("$PROJECT_DIR/bin/gate-keeper" run --layer=1 --format=junit 2>&1 || true)
+assert_contains "junit has xml header" '<?xml' echo "$local_output"
+assert_contains "junit has testsuites" 'testsuites' echo "$local_output"
+assert_contains "junit has testcase" 'testcase' echo "$local_output"
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: HTML output ---
+echo ""
+echo "── v2.0: HTML Output ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+local_output=$("$PROJECT_DIR/bin/gate-keeper" run --layer=1 --format=html 2>&1 || true)
+assert_contains "html has doctype" 'DOCTYPE' echo "$local_output"
+assert_contains "html has gate-keeper title" 'Gate Keeper' echo "$local_output"
+assert_contains "html has verdict" 'verdict' echo "$local_output"
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: --dry-run ---
+echo ""
+echo "── v2.0: Dry Run ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+assert_contains "dry-run shows DRY RUN" "DRY RUN" "$PROJECT_DIR/bin/gate-keeper" run --layer=1 --dry-run
+assert_pass "dry-run exits 0" "$PROJECT_DIR/bin/gate-keeper" run --layer=1 --dry-run
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: --quiet ---
+echo ""
+echo "── v2.0: Quiet Mode ──"
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: warn_quiet
+    pattern: "function greet"
+    paths: "src"
+    severity: warning
+YML
+local_output=$("$PROJECT_DIR/bin/gate-keeper" run --layer=1 --quiet 2>&1 || true)
+if echo "$local_output" | grep -qE "✓.*PASS.*ms"; then
+  printf "  ${RED}✗${RESET} quiet mode suppresses per-check PASS lines\n"
+  ((FAILED++)) || true
+else
+  printf "  ${GREEN}✓${RESET} quiet mode suppresses per-check PASS lines\n"
+  ((PASSED++)) || true
+fi
+assert_contains "quiet mode shows WARN" "WARN" echo "$local_output"
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: Suggest command ---
+echo ""
+echo "── v2.0: Suggest ──"
+cd "$FIXTURES_DIR/good-project"
+assert_contains "suggest detects project" "Detected" "$PROJECT_DIR/bin/gate-keeper" suggest
+rm -rf .gate-audit
+
+# --- Test: Audit trend ---
+echo ""
+echo "── v2.0: Audit Trend ──"
+cd "$FIXTURES_DIR/good-project"
+rm -rf .gate-audit
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+"$PROJECT_DIR/bin/gate-keeper" run --layer=1 >/dev/null 2>&1 || true
+sleep 1
+"$PROJECT_DIR/bin/gate-keeper" run --layer=1 >/dev/null 2>&1 || true
+assert_contains "audit --trend shows trend" "Pass Rate" "$PROJECT_DIR/bin/gate-keeper" audit --trend
+rm -rf .gate-audit .gatekeeper.yaml
+
+# --- Test: Audit CSV export ---
+echo ""
+echo "── v2.0: Audit CSV Export ──"
+cd "$FIXTURES_DIR/good-project"
+rm -rf .gate-audit
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+"$PROJECT_DIR/bin/gate-keeper" run --layer=1 >/dev/null 2>&1 || true
+assert_contains "audit --export=csv has header" "timestamp" "$PROJECT_DIR/bin/gate-keeper" audit --export=csv
+rm -rf .gate-audit .gatekeeper.yaml
+
+# --- Test: Audit heatmap ---
+echo ""
+echo "── v2.0: Audit Heatmap ──"
+cd "$FIXTURES_DIR/good-project"
+rm -rf .gate-audit
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+"$PROJECT_DIR/bin/gate-keeper" run --layer=1 >/dev/null 2>&1 || true
+assert_contains "audit --heatmap shows heatmap" "Heatmap" "$PROJECT_DIR/bin/gate-keeper" audit --heatmap
+rm -rf .gate-audit .gatekeeper.yaml
+
+# --- Test: Plugin list (empty) ---
+echo ""
+echo "── v2.0: Plugin System ──"
+cd "$FIXTURES_DIR/good-project"
+rm -rf .gate-plugins
+assert_contains "plugin list shows no plugins" "No plugins" "$PROJECT_DIR/bin/gate-keeper" plugin list
+rm -rf .gate-plugins
 
 # --- Summary ---
 echo ""

@@ -2,6 +2,40 @@
 # layer1.sh — Static checks (zero external dependencies, runs locally)
 
 gk_layer1_run() {
+  # Parallel mode: collect enabled checks as specs and dispatch to parallel engine
+  if [ "${GK_PARALLEL:-0}" != "0" ] && type gk_parallel_run_checks >/dev/null 2>&1; then
+    local -a specs=()
+    local -a check_defs=(
+      "A|go.work validation|go_work|gk_check_go_work"
+      "B|Shell script syntax|shell_syntax|gk_check_shell_syntax"
+      "C|Python packaging|python_packaging|gk_check_python_packaging"
+      "D|Dockerfile COPY paths|dockerfile_copy|gk_check_dockerfile_copy"
+      "E|Dockerfile anti-patterns|dockerfile_antipatterns|gk_check_dockerfile_antipatterns"
+      "F|secretRef ban|secretref_ban|gk_check_secretref_ban"
+      "G|Deprecated component refs|deprecated_refs|gk_check_deprecated_refs"
+      "H|Port chain consistency|port_chain|gk_check_port_chain"
+      "I|Namespace consistency|namespace_consistency|gk_check_namespace_consistency"
+    )
+    for def in "${check_defs[@]}"; do
+      local id="${def%%|*}"; local rest="${def#*|}"
+      local cname="${rest%%|*}"; rest="${rest#*|}"
+      local key="${rest%%|*}"; local fn="${rest#*|}"
+      if [ "$(gk_config_enabled "$key")" = "true" ]; then
+        local sev
+        sev=$(gk_config_value "${key}.severity" "critical")
+        specs+=("${id}|${cname}|${sev}|${fn}")
+      else
+        gk_skip_check "$id" "$cname" "disabled"
+      fi
+    done
+    if [ ${#specs[@]} -gt 0 ]; then
+      gk_parallel_run_checks "${specs[@]}" || true
+    fi
+    gk_run_custom_checks
+    return
+  fi
+
+  # Sequential mode (default)
   gk_maybe_run "A" "go.work validation" "go_work" gk_check_go_work
   gk_maybe_run "B" "Shell script syntax" "shell_syntax" gk_check_shell_syntax
   gk_maybe_run "C" "Python packaging" "python_packaging" gk_check_python_packaging
@@ -12,6 +46,33 @@ gk_layer1_run() {
   gk_maybe_run "H" "Port chain consistency" "port_chain" gk_check_port_chain
   gk_maybe_run "I" "Namespace consistency" "namespace_consistency" gk_check_namespace_consistency
   gk_run_custom_checks
+}
+
+# Build grep exclude arguments shared across all check types
+# Populates the caller's grep_args array variable
+_gk_build_grep_excludes() {
+  local extra_exclude_dirs="${1:-}"
+  grep_args=()
+  local default_excludes="node_modules .next dist build vendor .git __pycache__ .venv"
+  for d in $default_excludes; do
+    grep_args+=(--exclude-dir="$d")
+  done
+  if [ -n "$extra_exclude_dirs" ]; then
+    for d in ${extra_exclude_dirs//,/ }; do
+      grep_args+=(--exclude-dir="$d")
+    done
+  fi
+  if [ -f ".gatekeeperignore" ]; then
+    while IFS= read -r line; do
+      line="${line%%#*}"; line="${line%/}"; line=$(echo "$line" | tr -d '[:space:]')
+      [ -z "$line" ] && continue
+      if [[ "$line" == *.* ]] && [[ "$line" != */* ]]; then
+        grep_args+=(--exclude="$line")
+      else
+        grep_args+=(--exclude-dir="$line")
+      fi
+    done < ".gatekeeperignore"
+  fi
 }
 
 # Config-driven run-or-skip wrapper
@@ -222,7 +283,8 @@ gk_run_custom_checks() {
   # Parse custom_checks items from config using awk
   # Supports both "  custom_checks:" (layer1 sub-section) and "custom_checks:" (top-level)
   # Output format per item: fields separated by ASCII Unit Separator (0x1f)
-  # Fields: id, pattern, paths, severity, command, exclude, exclude_dirs, fix_hint
+  # Fields: id, pattern, paths, severity, command, exclude, exclude_dirs, fix_hint,
+  #         drift_requires, drift_requires_paths, drift_mode, must_match, must_match_count
   local SEP=$'\x1f'
   local items
   items=$(awk -v sep="$SEP" '
@@ -230,8 +292,8 @@ gk_run_custom_checks() {
     /^custom_checks:/ { in_cc=1; next }
     in_cc && /^[a-zA-Z]/ { in_cc=0 }
     in_cc && /^[[:space:]]*- id:/ {
-      if (id != "") print id sep pat sep pths sep sev sep cmd sep excl sep exdirs sep hint
-      id=$NF; pat=""; pths="."; sev="critical"; cmd=""; excl=""; exdirs=""; hint=""
+      if (id != "") print id sep pat sep pths sep sev sep cmd sep excl sep exdirs sep hint sep dreq sep dreqp sep dmode sep mmatch sep mmcount
+      id=$NF; pat=""; pths="."; sev="critical"; cmd=""; excl=""; exdirs=""; hint=""; dreq=""; dreqp=""; dmode=""; mmatch=""; mmcount=""; ctags=""
     }
     in_cc && /^[[:space:]]*pattern:/ { gsub(/^[[:space:]]*pattern:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); pat=$0 }
     in_cc && /^[[:space:]]*paths:/ { gsub(/^[[:space:]]*paths:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); gsub(/[\[\]]/,""); gsub(/,/," "); pths=$0 }
@@ -240,25 +302,195 @@ gk_run_custom_checks() {
     in_cc && /^[[:space:]]*exclude_pattern:/ { gsub(/^[[:space:]]*exclude_pattern:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); excl=$0 }
     in_cc && /^[[:space:]]*exclude_dirs:/ { gsub(/^[[:space:]]*exclude_dirs:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); exdirs=$0 }
     in_cc && /^[[:space:]]*fix_hint:/ { gsub(/^[[:space:]]*fix_hint:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); hint=$0 }
-    END { if (id != "") print id sep pat sep pths sep sev sep cmd sep excl sep exdirs sep hint }
+    in_cc && /^[[:space:]]*requires:/ { gsub(/^[[:space:]]*requires:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); dreq=$0 }
+    in_cc && /^[[:space:]]*requires_paths:/ { gsub(/^[[:space:]]*requires_paths:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); gsub(/[\[\]]/,""); gsub(/,/," "); dreqp=$0 }
+    in_cc && /^[[:space:]]*drift_mode:/ { gsub(/^[[:space:]]*drift_mode:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); dmode=$0 }
+    in_cc && /^[[:space:]]*must_match:/ { gsub(/^[[:space:]]*must_match:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); mmatch=$0 }
+    in_cc && /^[[:space:]]*must_match_count:/ { gsub(/^[[:space:]]*must_match_count:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); mmcount=$0 }
+    in_cc && /^[[:space:]]*tags:/ { gsub(/^[[:space:]]*tags:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); ctags=$0 }
+    END { if (id != "") print id sep pat sep pths sep sev sep cmd sep excl sep exdirs sep hint sep dreq sep dreqp sep dmode sep mmatch sep mmcount sep ctags }
   ' "$GK_CONFIG" 2>/dev/null)
 
   [ -z "$items" ] && return 0
 
   local idx=0
-  while IFS="$SEP" read -r check_id check_pattern check_paths check_severity check_command check_exclude check_exclude_dirs check_fix_hint; do
+  while IFS="$SEP" read -r check_id check_pattern check_paths check_severity check_command check_exclude check_exclude_dirs check_fix_hint check_requires check_requires_paths check_drift_mode check_must_match check_must_match_count check_tags; do
     [ -z "$check_id" ] && continue
     idx=$((idx + 1))
     local label="custom-${idx}"
     local name="Custom: ${check_id}"
 
+    # Tag filtering: skip if --tags is set and check tags don't match
+    if [ -n "${GK_TAGS:-}" ] && [ -n "$check_tags" ]; then
+      if type _gk_tags_match >/dev/null 2>&1 && ! _gk_tags_match "$check_tags"; then
+        gk_skip_check "$label" "$name" "tag-filtered"
+        continue
+      fi
+    elif [ -n "${GK_TAGS:-}" ] && [ -z "$check_tags" ]; then
+      # Check has no tags but filter is active — skip
+      gk_skip_check "$label" "$name" "tag-filtered"
+      continue
+    fi
+
     if [ -n "$check_command" ]; then
       gk_run_check "$label" "$name" "$check_severity" bash -c "$check_command"
+    elif [ -n "$check_must_match" ]; then
+      # must_match: pattern must be found (reverse semantics)
+      local min_count="${check_must_match_count:-1}"
+      gk_run_check "$label" "$name" "$check_severity" \
+        _gk_must_match_check "$check_must_match" "$check_paths" "$check_exclude_dirs" "$check_fix_hint" "$min_count"
+    elif [ -n "$check_drift_mode" ] && [ -n "$check_pattern" ]; then
+      # Drift check: commented mode, or requires-based drift
+      gk_run_check "$label" "$name" "$check_severity" \
+        _gk_drift_check "$check_pattern" "$check_paths" "$check_requires" "$check_requires_paths" "$check_drift_mode" "$check_exclude_dirs" "$check_fix_hint"
+    elif [ -n "$check_requires" ] && [ -n "$check_pattern" ]; then
+      # Drift check (implicit global mode): if pattern found, requires must also be found
+      gk_run_check "$label" "$name" "$check_severity" \
+        _gk_drift_check "$check_pattern" "$check_paths" "$check_requires" "$check_requires_paths" "global" "$check_exclude_dirs" "$check_fix_hint"
     elif [ -n "$check_pattern" ]; then
       gk_run_check "$label" "$name" "$check_severity" \
         _gk_pattern_check "$check_pattern" "$check_paths" "$check_exclude" "$check_exclude_dirs" "$check_fix_hint"
     fi
   done <<< "$items"
+}
+
+# Drift check: if pattern A is found, pattern B (requires) must also be found.
+# Detects "defined but not activated" security drift.
+#
+# drift_mode controls the matching scope:
+#   "global"   (default) — A found anywhere + B found anywhere = PASS
+#   "per_file" — for EACH file where A is found, B must also be found in that file
+#   "commented" — pattern found inside comments (// or #) = FAIL (disabled code detection)
+#
+# Args: pattern, paths, requires, requires_paths, drift_mode, exclude_dirs, fix_hint
+_gk_drift_check() {
+  local pattern="$1"
+  local paths="${2:-.}"
+  local requires="$3"
+  local requires_paths="${4:-$paths}"
+  local drift_mode="${5:-global}"
+  local exclude_dirs="${6:-}"
+  local fix_hint="${7:-}"
+
+  local -a grep_args=()
+  _gk_build_grep_excludes "$exclude_dirs"
+
+  case "$drift_mode" in
+    commented)
+      # Check if the pattern exists ONLY inside comments (disabled code)
+      # grep -rn output format: "file:line:content" — we check the content portion
+      local errors=0
+      for p in $paths; do
+        local all_matches=$(grep -rn "${grep_args[@]}" "$pattern" $p 2>/dev/null || true)
+        [ -z "$all_matches" ] && continue
+
+        # Extract code portion (after file:line:) and check for comment markers
+        local commented_count=0
+        local active_count=0
+        while IFS= read -r match_line; do
+          # Extract the code content after "file:linenum:"
+          local code_part=$(echo "$match_line" | sed 's/^[^:]*:[0-9]*://')
+          local trimmed=$(echo "$code_part" | sed 's/^[[:space:]]*//')
+          if [[ "$trimmed" == //* ]] || [[ "$trimmed" == \#* ]] || [[ "$trimmed" == /\** ]] || [[ "$trimmed" == \** ]]; then
+            ((commented_count++)) || true
+          else
+            ((active_count++)) || true
+          fi
+        done <<< "$all_matches"
+
+        if [ $commented_count -gt 0 ] && [ $active_count -eq 0 ]; then
+          echo "Drift: '$pattern' found only in comments (disabled):"
+          echo "$all_matches" | head -5
+          if [ -n "$fix_hint" ]; then
+            echo "  Fix: $fix_hint"
+          fi
+          ((errors++)) || true
+        fi
+      done
+      [ $errors -eq 0 ] || return 1
+      return 0
+      ;;
+
+    per_file)
+      # For each file containing pattern, requires must also be in that file
+      local errors=0
+      for p in $paths; do
+        local files_with_pattern=$(grep -rl "${grep_args[@]}" "$pattern" $p 2>/dev/null || true)
+        [ -z "$files_with_pattern" ] && continue
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          if ! grep -q "$requires" "$f" 2>/dev/null; then
+            echo "Drift: '$pattern' found in $f but '$requires' missing"
+            ((errors++)) || true
+          fi
+        done <<< "$files_with_pattern"
+      done
+      if [ $errors -gt 0 ] && [ -n "$fix_hint" ]; then
+        echo "  Fix: $fix_hint"
+      fi
+      [ $errors -eq 0 ] || return 1
+      return 0
+      ;;
+
+    global|*)
+      # Pattern found anywhere → requires must also be found somewhere
+      local pattern_found=false
+      for p in $paths; do
+        if grep -rq "${grep_args[@]}" "$pattern" $p 2>/dev/null; then
+          pattern_found=true
+          break
+        fi
+      done
+
+      if [ "$pattern_found" = false ]; then
+        return 0  # Pattern not found, nothing to check
+      fi
+
+      # Pattern exists — now check requires
+      for p in $requires_paths; do
+        if grep -rq "${grep_args[@]}" "$requires" $p 2>/dev/null; then
+          return 0  # Both found, no drift
+        fi
+      done
+
+      # Drift detected: pattern exists but requires is missing
+      echo "Drift: '$pattern' found but '$requires' not found"
+      local source_file=$(grep -rl "${grep_args[@]}" "$pattern" $paths 2>/dev/null | head -1)
+      [ -n "$source_file" ] && echo "  Source: $source_file"
+      if [ -n "$fix_hint" ]; then
+        echo "  Fix: $fix_hint"
+      fi
+      return 1
+      ;;
+  esac
+}
+
+# Reverse pattern check: exits non-zero if pattern NOT found (must_match semantics)
+# Args: pattern, paths, exclude_dirs, fix_hint, min_count
+_gk_must_match_check() {
+  local pattern="$1" paths="${2:-.}" exclude_dirs="${3:-}" fix_hint="${4:-}" min_count="${5:-1}"
+
+  local -a grep_args=()
+  _gk_build_grep_excludes "$exclude_dirs"
+
+  local errors=0
+  for p in $paths; do
+    local count
+    count=$(grep -rc "${grep_args[@]}" "$pattern" $p 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')
+    if [ "$count" -lt "$min_count" ]; then
+      if [ "$min_count" -eq 1 ]; then
+        echo "Required pattern '$pattern' NOT found in $p"
+      else
+        echo "Required pattern '$pattern' found $count time(s) in $p (need >= $min_count)"
+      fi
+      if [ -n "$fix_hint" ]; then
+        echo "  Fix: $fix_hint"
+      fi
+      ((errors++)) || true
+    fi
+  done
+  [ $errors -eq 0 ] || return 1
+  return 0
 }
 
 # Execute a grep-based pattern check; exits non-zero if pattern found
@@ -267,37 +499,8 @@ _gk_pattern_check() {
   local pattern="$1" paths="${2:-.}" exclude="${3:-}" exclude_dirs="${4:-}" fix_hint="${5:-}"
   local errors=0
 
-  # Build exclude-dir arguments from: explicit exclude_dirs + .gatekeeperignore + defaults
   local -a grep_args=()
-  local default_excludes="node_modules .next dist build vendor .git __pycache__ .venv"
-
-  # Add default excludes
-  for d in $default_excludes; do
-    grep_args+=(--exclude-dir="$d")
-  done
-
-  # Add per-check exclude_dirs (comma or space separated)
-  if [ -n "$exclude_dirs" ]; then
-    local cleaned="${exclude_dirs//,/ }"
-    for d in $cleaned; do
-      grep_args+=(--exclude-dir="$d")
-    done
-  fi
-
-  # Add .gatekeeperignore entries
-  if [ -f ".gatekeeperignore" ]; then
-    while IFS= read -r line; do
-      line="${line%%#*}"                 # strip comments
-      line="${line%/}"                   # strip trailing slash
-      line=$(echo "$line" | tr -d '[:space:]')
-      [ -z "$line" ] && continue
-      if [[ "$line" == *.* ]] && [[ "$line" != */* ]]; then
-        grep_args+=(--exclude="$line")   # file glob like *.min.js
-      else
-        grep_args+=(--exclude-dir="$line")
-      fi
-    done < ".gatekeeperignore"
-  fi
+  _gk_build_grep_excludes "$exclude_dirs"
 
   for p in $paths; do
     local found=""

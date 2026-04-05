@@ -6,14 +6,22 @@ GK_AUDIT_DIR="${GK_AUDIT_DIR:-.gate-audit}"
 GK_LAYER="${GK_LAYER:-all}"
 GK_FORMAT="${GK_FORMAT:-text}"
 GK_CI="${GK_CI:-false}"
+GK_FAIL_ON="${GK_FAIL_ON:-critical}"
+GK_PARALLEL="${GK_PARALLEL:-0}"
+GK_DRY_RUN="${GK_DRY_RUN:-false}"
+GK_QUIET="${GK_QUIET:-false}"
+GK_TAGS="${GK_TAGS:-}"
 GK_PROJECT="unknown"
 GK_NAMESPACE="production"
 GK_SECRET_NAME="perseworks-secret"
+GK_PLUGIN_DIR="${GK_PLUGIN_DIR:-.gate-plugins}"
 
 GK_PASSED=0
 GK_FAILED=0
 GK_SKIPPED=0
 GK_WARNINGS=0
+GK_INFOS=0
+GK_HIGHS=0
 GK_CHECKS=()
 GK_START_TIME=""
 
@@ -29,10 +37,15 @@ gk_now_ms() {
 gk_parse_run_args() {
   for arg in "$@"; do
     case "$arg" in
-      --layer=*)   GK_LAYER="${arg#*=}" ;;
-      --config=*)  GK_CONFIG="${arg#*=}" ;;
-      --format=*)  GK_FORMAT="${arg#*=}" ;;
-      --ci)        GK_CI=true; GK_FORMAT=json ;;
+      --layer=*)    GK_LAYER="${arg#*=}" ;;
+      --config=*)   GK_CONFIG="${arg#*=}" ;;
+      --format=*)   GK_FORMAT="${arg#*=}" ;;
+      --fail-on=*)  GK_FAIL_ON="${arg#*=}" ;;
+      --parallel=*) GK_PARALLEL="${arg#*=}" ;;
+      --dry-run)    GK_DRY_RUN=true ;;
+      --quiet)      GK_QUIET=true ;;
+      --tags=*)     GK_TAGS="${arg#*=}" ;;
+      --ci)         GK_CI=true; GK_FORMAT=json ;;
     esac
   done
 }
@@ -57,7 +70,19 @@ gk_config_enabled() {
     echo "$default"
     return
   fi
+  # Check flat disable: "key: false"
   if grep -q "^\s*${key}:\s*false" "$GK_CONFIG" 2>/dev/null; then
+    echo "false"
+    return
+  fi
+  # Check nested disable: "key:\n  enabled: false"
+  local nested_enabled
+  nested_enabled=$(awk -v key="$key" '
+    $0 ~ ("^[[:space:]]*" key ":") { in_section=1; next }
+    in_section && /^[[:space:]]*enabled:/ { print $NF; exit }
+    in_section && /^[a-zA-Z]/ { exit }
+  ' "$GK_CONFIG" 2>/dev/null)
+  if [ "$nested_enabled" = "false" ]; then
     echo "false"
   else
     echo "$default"
@@ -122,7 +147,9 @@ gk_record() {
   case "$status" in
     PASS) ((GK_PASSED++)) || true ;;
     FAIL) ((GK_FAILED++)) || true ;;
+    HIGH) ((GK_HIGHS++)) || true ;;
     WARN) ((GK_WARNINGS++)) || true ;;
+    INFO) ((GK_INFOS++)) || true ;;
     *)    ((GK_SKIPPED++)) || true ;;
   esac
 }
@@ -137,11 +164,13 @@ gk_run_check() {
   if output=$("$@" 2>&1); then
     status="PASS"
   else
-    if [ "$severity" = "warning" ]; then
-      status="WARN"
-    else
-      status="FAIL"
-    fi
+    case "$severity" in
+      critical) status="FAIL" ;;
+      high)     status="HIGH" ;;
+      warning)  status="WARN" ;;
+      info)     status="INFO" ;;
+      *)        status="FAIL" ;;
+    esac
   fi
 
   local end_ms=$(gk_now_ms)
@@ -180,10 +209,29 @@ gk_write_audit() {
   local verdict
   if [ $GK_FAILED -gt 0 ]; then
     verdict="BLOCKED"
+  elif [ $GK_HIGHS -gt 0 ]; then
+    verdict="BLOCKED"
   elif [ $GK_WARNINGS -gt 0 ]; then
     verdict="WARNED"
   else
     verdict="PASSED"
+  fi
+
+  # Apply --fail-on threshold to override verdict
+  local effective_fail=false
+  case "$GK_FAIL_ON" in
+    critical)
+      [ $GK_FAILED -gt 0 ] && effective_fail=true ;;
+    high)
+      { [ $GK_FAILED -gt 0 ] || [ $GK_HIGHS -gt 0 ]; } && effective_fail=true ;;
+    warning)
+      { [ $GK_FAILED -gt 0 ] || [ $GK_HIGHS -gt 0 ] || [ $GK_WARNINGS -gt 0 ]; } && effective_fail=true ;;
+    none)
+      effective_fail=false ;;
+  esac
+
+  if [ "$effective_fail" = true ]; then
+    verdict="BLOCKED"
   fi
 
   cat > "$filename" <<EOF
@@ -192,15 +240,70 @@ gk_write_audit() {
   "git_sha": "$git_sha",
   "project": "$GK_PROJECT",
   "layer": "$GK_LAYER",
+  "fail_on": "$GK_FAIL_ON",
   "checks": [$checks_json],
   "passed": $GK_PASSED,
   "failed": $GK_FAILED,
+  "high": $GK_HIGHS,
   "skipped": $GK_SKIPPED,
   "warnings": $GK_WARNINGS,
+  "infos": $GK_INFOS,
   "verdict": "$verdict"
 }
 EOF
   echo "$filename"
+}
+
+# Dry-run preview: show checks that would run without executing
+gk_dry_run_preview() {
+  echo ""
+  echo "============================================"
+  echo "  Gate Keeper v${VERSION} · DRY RUN"
+  echo "============================================"
+  echo ""
+  echo "  Project:  ${GK_PROJECT:-unknown}"
+  echo "  Layer:    $GK_LAYER"
+  echo "  Fail-on:  $GK_FAIL_ON"
+  echo "  Format:   $GK_FORMAT"
+  [ -n "$GK_TAGS" ] && echo "  Tags:     $GK_TAGS"
+  echo ""
+
+  local run_l1=false run_l2=false run_l3=false
+  case "$GK_LAYER" in
+    1)   run_l1=true ;;
+    2)   run_l1=true; run_l2=true ;;
+    3)   run_l1=true; run_l2=true; run_l3=true ;;
+    all) run_l1=true; run_l2=true; run_l3=true ;;
+  esac
+
+  if [ "$run_l1" = true ]; then
+    echo "  Layer 1: Static Checks"
+    for check in A:go_work B:shell_syntax C:python_packaging D:dockerfile_copy E:dockerfile_antipatterns F:secretref_ban G:deprecated_refs H:port_chain I:namespace_consistency; do
+      local id="${check%%:*}" key="${check#*:}"
+      local enabled=$(gk_config_enabled "$key")
+      local sev=$(gk_config_value "${key}.severity" "critical")
+      if [ "$enabled" = "true" ]; then
+        printf "    [%s] %-35s (%s)\n" "$id" "$key" "$sev"
+      else
+        printf "    [%s] %-35s (disabled)\n" "$id" "$key"
+      fi
+    done
+  fi
+  if [ "$run_l2" = true ]; then
+    echo "  Layer 2: Cluster Validation"
+    echo "    [J] deployment_name_match"
+    echo "    [K] image_name_match"
+    echo "    [L] secret_key_match"
+  fi
+  if [ "$run_l3" = true ]; then
+    echo "  Layer 3: Runtime Verification"
+    echo "    [M] healthz"
+    echo "    [N] pod_status"
+    echo "    [O] load_test"
+  fi
+  echo ""
+  echo "  (No checks executed in dry-run mode)"
+  echo ""
 }
 
 # H-4 Fix: --layer=N means run layers 1..N (cumulative), not just layer N
@@ -208,6 +311,12 @@ gk_run() {
   gk_parse_run_args "$@"
   gk_load_config || exit 1
   GK_START_TIME=$(gk_now_ms)
+
+  # --dry-run: preview checks without executing
+  if [ "$GK_DRY_RUN" = true ]; then
+    gk_dry_run_preview
+    return 0
+  fi
 
   gk_print_header
 
@@ -258,14 +367,56 @@ gk_run() {
     gk_annotate_deployments "$run_id"
   fi
 
+  # Run plugin checks if any plugins installed
+  if [ -d "$GK_PLUGIN_DIR" ] && type gk_plugin_run >/dev/null 2>&1; then
+    gk_plugin_run
+  fi
+
   local audit_file=$(gk_write_audit)
   local end_time=$(gk_now_ms)
   local total_ms=$(( end_time - ${GK_START_TIME:-0} ))
 
+  # Output in requested format
+  case "$GK_FORMAT" in
+    sarif)
+      if type gk_write_sarif >/dev/null 2>&1; then
+        gk_write_sarif
+      fi
+      ;;
+    junit)
+      if type gk_write_junit >/dev/null 2>&1; then
+        gk_write_junit
+      fi
+      ;;
+    html)
+      if type gk_write_html >/dev/null 2>&1; then
+        gk_write_html
+      fi
+      ;;
+  esac
+
   gk_print_summary "$total_ms" "$audit_file"
 
-  # Only critical failures block the pipeline
-  [ $GK_FAILED -eq 0 ] && return 0 || return 1
+  # Exit code semantics: 0=all pass, 1=failure (at or above threshold), 2=warnings only
+  local should_fail=false
+  case "$GK_FAIL_ON" in
+    critical)
+      [ $GK_FAILED -gt 0 ] && should_fail=true ;;
+    high)
+      ([ $GK_FAILED -gt 0 ] || [ $GK_HIGHS -gt 0 ]) && should_fail=true ;;
+    warning)
+      ([ $GK_FAILED -gt 0 ] || [ $GK_HIGHS -gt 0 ] || [ $GK_WARNINGS -gt 0 ]) && should_fail=true ;;
+    none)
+      should_fail=false ;;
+  esac
+
+  if [ "$should_fail" = true ]; then
+    return 1
+  elif [ $GK_WARNINGS -gt 0 ] || [ $GK_HIGHS -gt 0 ]; then
+    return 2
+  else
+    return 0
+  fi
 }
 
 # L-5 Fix: Overwrite protection for init
@@ -434,9 +585,9 @@ gk_add() {
 
   # Validate severity
   case "$severity" in
-    critical|warning) ;;
+    critical|high|warning|info) ;;
     *)
-      echo "Error: --severity must be 'critical' or 'warning'"
+      echo "Error: --severity must be 'critical', 'high', 'warning', or 'info'"
       exit 1
       ;;
   esac

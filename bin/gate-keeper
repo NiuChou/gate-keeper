@@ -3,7 +3,7 @@
 # https://github.com/NiuChou/gate-keeper
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="2.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
 TEMPLATE_DIR="${TEMPLATE_DIR:-${SCRIPT_DIR}/../templates}"
@@ -14,6 +14,12 @@ source "${LIB_DIR}/layer1.sh"
 source "${LIB_DIR}/layer2.sh"
 source "${LIB_DIR}/layer3.sh"
 source "${LIB_DIR}/supervision.sh"
+# Phase 1-5 extensions
+[ -f "${LIB_DIR}/formatters.sh" ] && source "${LIB_DIR}/formatters.sh"
+[ -f "${LIB_DIR}/parallel.sh" ]   && source "${LIB_DIR}/parallel.sh"
+[ -f "${LIB_DIR}/plugins.sh" ]    && source "${LIB_DIR}/plugins.sh"
+[ -f "${LIB_DIR}/audit_ext.sh" ]  && source "${LIB_DIR}/audit_ext.sh"
+[ -f "${LIB_DIR}/suggest.sh" ]    && source "${LIB_DIR}/suggest.sh"
 
 COMMAND="${1:-run}"
 shift 2>/dev/null || true
@@ -22,9 +28,44 @@ case "$COMMAND" in
   init)    gk_init "$@" ;;
   run)     gk_run "$@" ;;
   add)     gk_add "$@" ;;
-  audit)   gk_audit "$@" ;;
+  audit)
+    # Extended audit commands
+    for arg in "$@"; do
+      case "$arg" in
+        --trend)
+          gk_audit_trend 2>/dev/null || echo "Trend not available"
+          exit 0
+          ;;
+        --export=csv)
+          gk_audit_export_csv 2>/dev/null || echo "CSV export not available"
+          exit 0
+          ;;
+        --heatmap)
+          gk_audit_heatmap 2>/dev/null || echo "Heatmap not available"
+          exit 0
+          ;;
+      esac
+    done
+    gk_audit "$@"
+    ;;
   doctor)  gk_doctor "$@" ;;
   stamp)   gk_stamp "$@" ;;
+  suggest) gk_suggest "$@" ;;
+  plugin)
+    subcmd="${1:-help}"
+    shift 2>/dev/null || true
+    case "$subcmd" in
+      install) gk_plugin_install "$@" ;;
+      list)    gk_plugin_list ;;
+      remove)  gk_plugin_remove "$@" ;;
+      *)
+        echo "Usage: gate-keeper plugin <install|list|remove>"
+        echo "  install <url>   Install a rule pack from Git URL"
+        echo "  list            List installed plugins"
+        echo "  remove <name>   Remove a plugin"
+        ;;
+    esac
+    ;;
   version) echo "gate-keeper v${VERSION}" ;;
   help|--help|-h)
     echo "gate-keeper v${VERSION} — Three-layer deployment gatekeeper"
@@ -34,26 +75,48 @@ case "$COMMAND" in
     echo "  run       Execute checks (default)"
     echo "  add       Add a custom check to .gatekeeper.yaml"
     echo "  audit     View audit log history"
+    echo "  suggest   Analyze project and recommend checks"
+    echo "  plugin    Manage rule plugins (install/list/remove)"
     echo "  doctor    Self-check: verify checks are intact"
     echo "  stamp     Generate SHA256 hash file for tamper detection"
     echo "  version   Show version"
     echo ""
     echo "Options for 'run':"
-    echo "  --layer=1|2|3|all   Check layer (default: all)"
-    echo "  --config=PATH       Config file (default: .gatekeeper.yaml)"
-    echo "  --format=text|json  Output format (default: text)"
-    echo "  --ci                CI mode: strict, no colors"
+    echo "  --layer=1|2|3|all    Check layer (default: all)"
+    echo "  --config=PATH        Config file (default: .gatekeeper.yaml)"
+    echo "  --format=text|json|sarif|junit|html  Output format (default: text)"
+    echo "  --fail-on=LEVEL      Fail threshold: critical|high|warning|none (default: critical)"
+    echo "  --parallel=N         Max parallel checks (default: auto)"
+    echo "  --dry-run            Preview checks without executing"
+    echo "  --quiet              Only show FAIL/WARN/HIGH, suppress PASS/INFO"
+    echo "  --tags=TAG           Only run checks with matching tag"
+    echo "  --ci                 CI mode: strict, no colors"
     echo ""
     echo "Options for 'audit':"
-    echo "  --last=N            Show last N logs (default: 5)"
-    echo "  --diff              Compare two most recent audit runs"
+    echo "  --last=N             Show last N logs (default: 5)"
+    echo "  --diff               Compare two most recent audit runs"
+    echo "  --trend              Show pass rate trend (ASCII chart)"
+    echo "  --export=csv         Export audit history as CSV"
+    echo "  --heatmap            Show check duration heatmap"
     echo ""
     echo "Options for 'add':"
-    echo "  --id=ID             Check ID (required)"
-    echo "  --pattern=PATTERN   grep pattern to match (required)"
-    echo "  --paths=GLOB        Search path glob (default: .)"
-    echo "  --severity=critical|warning  Severity level (default: warning)"
-    echo "  --description=TEXT  Human-readable description"
+    echo "  --id=ID              Check ID (required)"
+    echo "  --pattern=PATTERN    grep pattern to match (required)"
+    echo "  --paths=GLOB         Search path glob (default: .)"
+    echo "  --severity=critical|high|warning|info  Severity level (default: warning)"
+    echo "  --description=TEXT   Human-readable description"
+    echo ""
+    echo "Custom check types in .gatekeeper.yaml:"
+    echo "  pattern:          Found = violation (ban a pattern)"
+    echo "  must_match:       Found = compliance (require a pattern)"
+    echo "  must_match_count: Minimum number of matches required"
+    echo "  command:          Exit 0 = PASS, non-zero = FAIL"
+    echo "  requires:         Drift detection (A exists → B must also exist)"
+    echo ""
+    echo "Exit codes:"
+    echo "  0  All checks passed"
+    echo "  1  Checks failed (at or above --fail-on threshold)"
+    echo "  2  Warnings only (no failures above threshold)"
     ;;
   *)
     echo "Unknown command: $COMMAND"
