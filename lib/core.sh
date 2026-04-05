@@ -13,6 +13,7 @@ GK_SECRET_NAME="perseworks-secret"
 GK_PASSED=0
 GK_FAILED=0
 GK_SKIPPED=0
+GK_WARNINGS=0
 GK_CHECKS=()
 GK_START_TIME=""
 
@@ -63,27 +64,72 @@ gk_config_enabled() {
   fi
 }
 
+# Read a nested YAML value from the config file.
+# Usage: gk_config_value "section.key" "default_value"
+# Handles two-level nesting: section:\n  key: value
+gk_config_value() {
+  local dotpath="$1" default="${2:-}"
+  if [ ! -f "$GK_CONFIG" ]; then
+    echo "$default"
+    return
+  fi
+  local section="${dotpath%%.*}"
+  local key="${dotpath#*.}"
+  # Use awk: find section header (any indent), then find key at greater indent
+  local value
+  value=$(awk -v section="${section}" -v key="${key}" '
+    {
+      # Detect section header: any indentation followed by section:
+      if ($0 ~ ("[[:space:]]*" section ":")) {
+        in_section=1
+        # Record the indent of the section line
+        match($0, /^[[:space:]]*/); sect_indent=RLENGTH
+        next
+      }
+      # If in section: check if we have left it (same or lesser indent, non-blank, non-comment)
+      if (in_section && /^[^ \t#]/ ) { in_section=0 }
+      if (in_section && /^[[:space:]]/ ) {
+        match($0, /^[[:space:]]*/); cur_indent=RLENGTH
+        if (cur_indent <= sect_indent && /[^ \t]/) { in_section=0 }
+      }
+    }
+    in_section && $0 ~ ("[[:space:]]+" key ":") {
+      val = $0
+      sub(/^[[:space:]]*[^:]*:[[:space:]]*/, "", val)
+      gsub(/"/, "", val)
+      print val
+      exit
+    }
+  ' "$GK_CONFIG" 2>/dev/null)
+  if [ -n "$value" ]; then
+    echo "$value"
+  else
+    echo "$default"
+  fi
+}
+
 # H-5 Fix: Escape all JSON string fields
 gk_json_escape() {
   echo "$1" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g' | cut -c1-200
 }
 
 gk_record() {
-  local id="$1" name="$2" status="$3" details="${4:-}" duration_ms="${5:-0}"
+  local id="$1" name="$2" status="$3" details="${4:-}" duration_ms="${5:-0}" severity="${6:-critical}"
   local eid=$(gk_json_escape "$id")
   local ename=$(gk_json_escape "$name")
   local edetails=$(gk_json_escape "$details")
-  GK_CHECKS+=("{\"id\":\"$eid\",\"name\":\"$ename\",\"status\":\"$status\",\"details\":\"$edetails\",\"duration_ms\":$duration_ms}")
+  GK_CHECKS+=("{\"id\":\"$eid\",\"name\":\"$ename\",\"status\":\"$status\",\"details\":\"$edetails\",\"duration_ms\":$duration_ms,\"severity\":\"$severity\"}")
   case "$status" in
     PASS) ((GK_PASSED++)) || true ;;
     FAIL) ((GK_FAILED++)) || true ;;
+    WARN) ((GK_WARNINGS++)) || true ;;
     *)    ((GK_SKIPPED++)) || true ;;
   esac
 }
 
 gk_run_check() {
-  local id="$1" name="$2"
-  shift 2
+  local id="$1" name="$2" severity="${3:-critical}"
+  shift 3
   local start_ms=$(gk_now_ms)
   local output=""
   local status="PASS"
@@ -91,13 +137,17 @@ gk_run_check() {
   if output=$("$@" 2>&1); then
     status="PASS"
   else
-    status="FAIL"
+    if [ "$severity" = "warning" ]; then
+      status="WARN"
+    else
+      status="FAIL"
+    fi
   fi
 
   local end_ms=$(gk_now_ms)
   local duration=$(( end_ms - start_ms ))
 
-  gk_record "$id" "$name" "$status" "$output" "$duration"
+  gk_record "$id" "$name" "$status" "$output" "$duration" "$severity"
   gk_print_check "$id" "$name" "$status" "$duration"
 }
 
@@ -120,6 +170,15 @@ gk_write_audit() {
     checks_json=$(printf '%s,' "${GK_CHECKS[@]}" | sed 's/,$//')
   fi
 
+  local verdict
+  if [ $GK_FAILED -gt 0 ]; then
+    verdict="BLOCKED"
+  elif [ $GK_WARNINGS -gt 0 ]; then
+    verdict="WARNED"
+  else
+    verdict="PASSED"
+  fi
+
   cat > "$filename" <<EOF
 {
   "timestamp": "$timestamp",
@@ -130,7 +189,8 @@ gk_write_audit() {
   "passed": $GK_PASSED,
   "failed": $GK_FAILED,
   "skipped": $GK_SKIPPED,
-  "verdict": "$([ $GK_FAILED -eq 0 ] && echo 'PASSED' || echo 'BLOCKED')"
+  "warnings": $GK_WARNINGS,
+  "verdict": "$verdict"
 }
 EOF
   echo "$filename"
@@ -175,12 +235,29 @@ gk_run() {
     fi
   fi
 
+  # Supervision: integrity check (runs always if hash file exists)
+  local hash_file="${GK_HASH_FILE:-.gate-keeper.sha256}"
+  if [ -f "$hash_file" ]; then
+    gk_run_check "S-1" "Integrity: gate-keeper files" "critical" gk_check_integrity
+  fi
+
+  # Supervision: annotate deployments with run-id on success
+  if [ $GK_FAILED -eq 0 ]; then
+    local timestamp
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    local git_sha
+    git_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    local run_id="${timestamp}-${git_sha}"
+    gk_annotate_deployments "$run_id"
+  fi
+
   local audit_file=$(gk_write_audit)
   local end_time=$(gk_now_ms)
   local total_ms=$(( end_time - ${GK_START_TIME:-0} ))
 
   gk_print_summary "$total_ms" "$audit_file"
 
+  # Only critical failures block the pipeline
   [ $GK_FAILED -eq 0 ] && return 0 || return 1
 }
 
@@ -247,6 +324,114 @@ gk_audit() {
   done < <(ls -t "$GK_AUDIT_DIR"/*.json 2>/dev/null | head -n "$count")
 }
 
+gk_add() {
+  local id="" pattern="" paths="." severity="warning" description=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      --id=*)          id="${arg#*=}" ;;
+      --pattern=*)     pattern="${arg#*=}" ;;
+      --paths=*)       paths="${arg#*=}" ;;
+      --severity=*)    severity="${arg#*=}" ;;
+      --description=*) description="${arg#*=}" ;;
+    esac
+  done
+
+  if [ -z "$id" ]; then
+    echo "Error: --id is required"
+    echo "Usage: gate-keeper add --id=ID --pattern=PATTERN [--paths=GLOB] [--severity=critical|warning] [--description=TEXT]"
+    exit 1
+  fi
+
+  if [ -z "$pattern" ]; then
+    echo "Error: --pattern is required"
+    echo "Usage: gate-keeper add --id=ID --pattern=PATTERN [--paths=GLOB] [--severity=critical|warning] [--description=TEXT]"
+    exit 1
+  fi
+
+  if [ ! -f "$GK_CONFIG" ]; then
+    echo "Error: $GK_CONFIG not found. Run 'gate-keeper init' first."
+    exit 1
+  fi
+
+  # Check if id already exists in config
+  if grep -q "^\s*- id: ${id}$" "$GK_CONFIG" 2>/dev/null; then
+    echo "Error: custom check '${id}' already exists in $GK_CONFIG"
+    exit 1
+  fi
+
+  # Validate severity
+  case "$severity" in
+    critical|warning) ;;
+    *)
+      echo "Error: --severity must be 'critical' or 'warning'"
+      exit 1
+      ;;
+  esac
+
+  local tmp_file="${GK_CONFIG}.gk_tmp"
+
+  # Build description line (may be empty)
+  local desc_line=""
+  [ -n "$description" ] && desc_line="      description: \"${description}\""
+
+  if grep -q "^  custom_checks:" "$GK_CONFIG" 2>/dev/null; then
+    # custom_checks section exists — append new item at end of the block
+    awk -v id="$id" -v pat="$pattern" -v pths="$paths" -v sev="$severity" -v desc="$desc_line" '
+      /^  custom_checks:/ { in_cc=1 }
+      in_cc && /^[a-zA-Z]/ { in_cc=0 }
+      in_cc && /^    - id:/ { last_item=NR }
+      { lines[NR]=$0 }
+      END {
+        insert_after=last_item
+        # advance past all sub-key lines of the last item
+        while (insert_after+1 <= NR && lines[insert_after+1] ~ /^      /) insert_after++
+        for (i=1; i<=NR; i++) {
+          print lines[i]
+          if (i==insert_after) {
+            print "    - id: " id
+            print "      pattern: \"" pat "\""
+            print "      paths: \"" pths "\""
+            print "      severity: " sev
+            if (desc != "") print desc
+          }
+        }
+      }
+    ' "$GK_CONFIG" > "$tmp_file"
+  else
+    # No custom_checks section yet — append it inside layer1 block before next top-level key
+    awk -v id="$id" -v pat="$pattern" -v pths="$paths" -v sev="$severity" -v desc="$desc_line" '
+      /^layer1:/ { in_l1=1 }
+      in_l1 && /^[a-zA-Z]/ && !/^layer1:/ {
+        if (!inserted) {
+          print "  custom_checks:"
+          print "    - id: " id
+          print "      pattern: \"" pat "\""
+          print "      paths: \"" pths "\""
+          print "      severity: " sev
+          if (desc != "") print desc
+          inserted=1
+        }
+        in_l1=0
+      }
+      { print }
+      END {
+        if (in_l1 && !inserted) {
+          print "  custom_checks:"
+          print "    - id: " id
+          print "      pattern: \"" pat "\""
+          print "      paths: \"" pths "\""
+          print "      severity: " sev
+          if (desc != "") print desc
+        }
+      }
+    ' "$GK_CONFIG" > "$tmp_file"
+  fi
+
+  mv "$tmp_file" "$GK_CONFIG"
+  echo "Added custom check '${id}' to ${GK_CONFIG}"
+}
+
 gk_doctor() {
   echo "Gate Keeper Doctor"
   echo ""
@@ -279,6 +464,18 @@ gk_doctor() {
     echo "  [OK] kubectl (Layer 2+3 enabled)"
   else
     echo "  [--] kubectl not available (Layer 2+3 will skip)"
+  fi
+
+  local hash_file="${GK_HASH_FILE:-.gate-keeper.sha256}"
+  if [ -f "$hash_file" ]; then
+    if gk_check_integrity >/dev/null 2>&1; then
+      echo "  [OK] Integrity hash: $hash_file (verified)"
+    else
+      echo "  [!!] Integrity hash: $hash_file (VIOLATION — files modified)"
+      ((issues++)) || true
+    fi
+  else
+    echo "  [--] Integrity hash not found (run 'gate-keeper stamp' to enable tamper detection)"
   fi
 
   echo ""

@@ -26,3 +26,13 @@ audit:
 selfcheck:
   min_layer1_checks: 2
   min_layer2_checks: 0
+
+# Custom checks (uncomment and modify as needed):
+# custom_checks:
+#   - id: no_console_log
+#     description: "Ban console.log statements"
+#     pattern: "console.log"
+#     paths: "src"
+#   - id: lint_check
+#     description: "Run linter"
+#     command: "npm run lint --silent"

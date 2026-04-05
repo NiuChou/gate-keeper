@@ -73,6 +73,16 @@ assert_fail "init refuses overwrite" "$PROJECT_DIR/bin/gate-keeper" init
 assert_pass "init --force overwrites" "$PROJECT_DIR/bin/gate-keeper" init --force --type=minimal
 rm -f .gatekeeper.yaml
 
+# --- Test: Init template detection ---
+echo ""
+echo "── Init Template Detection ──"
+cd "$FIXTURES_DIR/good-project"
+rm -f .gatekeeper.yaml
+for tmpl in minimal k8s-go k8s-python nextjs monorepo; do
+  assert_pass "init --type=$tmpl" "$PROJECT_DIR/bin/gate-keeper" init --type=$tmpl --force
+done
+rm -f .gatekeeper.yaml
+
 # --- Test: Layer 1 checks ---
 echo ""
 echo "── Layer 1: Good Project ──"
@@ -105,6 +115,185 @@ YML
 assert_pass "disabled checks are skipped" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
 rm -f .gatekeeper.yaml
 
+# --- Test: Severity — warning does not block ---
+echo ""
+echo "── Severity: warning failure does not block ──"
+cd "$FIXTURES_DIR/bad-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: production
+layer1:
+  secretref_ban:
+    enabled: true
+    severity: warning
+  namespace_consistency: false
+  port_chain: false
+  deprecated_refs: false
+YML
+assert_pass "warning-severity failure exits 0" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+
+# --- Test: Severity — critical blocks ---
+echo ""
+echo "── Severity: critical failure blocks ──"
+cd "$FIXTURES_DIR/bad-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: production
+layer1:
+  secretref_ban:
+    enabled: true
+    severity: critical
+  namespace_consistency: false
+  port_chain: false
+  deprecated_refs: false
+YML
+assert_fail "critical-severity failure exits 1" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+
+# --- Test: exclude_pattern ---
+echo ""
+echo "── exclude_pattern ──"
+cd "$FIXTURES_DIR/bad-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: production
+layer1:
+  secretref_ban:
+    enabled: true
+    severity: critical
+    exclude_pattern: "secretRef"
+  namespace_consistency: false
+  port_chain: false
+  deprecated_refs: false
+YML
+assert_pass "exclude_pattern suppresses secretRef match" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+
+# --- Test: add command ---
+echo ""
+echo "── Add Command ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+sed -i.bak 's/my-project/test-project/' .gatekeeper.yaml && rm -f .gatekeeper.yaml.bak
+
+assert_pass "add creates custom check" \
+  "$PROJECT_DIR/bin/gate-keeper" add --id=no_console_log --pattern="console.log" --paths="."
+assert_contains "add confirms success" "no_debugger" \
+  "$PROJECT_DIR/bin/gate-keeper" add --id=no_debugger --pattern="debugger;" --paths="." --severity=warning --description="Ban debugger"
+assert_fail "add rejects duplicate id" \
+  "$PROJECT_DIR/bin/gate-keeper" add --id=no_console_log --pattern="console.log" --paths="."
+assert_fail "add requires --id" \
+  "$PROJECT_DIR/bin/gate-keeper" add --pattern="console.log"
+assert_fail "add requires --pattern" \
+  "$PROJECT_DIR/bin/gate-keeper" add --id=some_check
+assert_fail "add fails without config" bash -c \
+  "GK_CONFIG=.no_such_file.yaml $PROJECT_DIR/bin/gate-keeper add --id=x --pattern=y"
+
+# Verify run executes custom checks (no_console_log pattern not present in project → should PASS)
+assert_pass "run executes custom checks (pass case)" \
+  "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+
+# Test custom check FAIL: add a pattern that matches an existing file
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+sed -i.bak 's/my-project/test-project/' .gatekeeper.yaml && rm -f .gatekeeper.yaml.bak
+# Add a check that will find "project:" in .gatekeeper.yaml itself (severity=critical to block)
+"$PROJECT_DIR/bin/gate-keeper" add --id=find_project_key --pattern="^project:" --paths=".gatekeeper.yaml" --severity=critical >/dev/null 2>&1 || true
+assert_fail "run fails when custom check matches" \
+  "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml .gate-audit 2>/dev/null || true
+rm -rf .gate-audit
+
+# --- Test: Custom Checks (pattern and command modes) ---
+echo ""
+echo "── Custom Checks ──"
+cd "$FIXTURES_DIR/good-project"
+
+# Test pattern mode: pattern absent → check passes
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: no_console_log
+    description: "Ban console.log"
+    pattern: "console.log"
+    paths: "src"
+YML
+assert_pass "custom pattern check passes when pattern absent" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Test pattern mode: pattern present → check fails
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: find_greet
+    description: "Detect greet function"
+    pattern: "function greet"
+    paths: "src"
+YML
+assert_fail "custom pattern check fails when pattern found" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Test command mode: passing command → check passes
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: true_cmd
+    description: "Command that always succeeds"
+    command: "true"
+YML
+assert_pass "custom command check passes on exit 0" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Test command mode: failing command → check fails
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: false_cmd
+    description: "Command that always fails"
+    command: "false"
+YML
+assert_fail "custom command check fails on exit 1" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Test no custom_checks section → no effect
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+YML
+assert_pass "no custom_checks section has no effect" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+rm -f .gatekeeper.yaml
+
 # --- Test: Audit log ---
 echo ""
 echo "── Audit Log ──"
@@ -122,6 +311,75 @@ echo ""
 echo "── Doctor ──"
 cd "$FIXTURES_DIR/good-project"
 assert_contains "doctor finds no config" "Config not found" "$PROJECT_DIR/bin/gate-keeper" doctor
+
+# --- Test: Doctor with config ---
+echo ""
+echo "── Doctor (with config) ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+assert_contains "doctor finds config" "OK" "$PROJECT_DIR/bin/gate-keeper" doctor
+rm -f .gatekeeper.yaml
+
+# --- Test: Layer 2 (no kubectl) ---
+echo ""
+echo "── Layer 2: No kubectl ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/k8s-go.yaml" .gatekeeper.yaml
+sed -i.bak 's/my-project/test-project/' .gatekeeper.yaml && rm -f .gatekeeper.yaml.bak
+assert_contains "layer 2 skips without kubectl" "SKIP" "$PROJECT_DIR/bin/gate-keeper" run --layer=2
+rm -f .gatekeeper.yaml
+
+# --- Test: Layer 3 (no kubectl) ---
+echo ""
+echo "── Layer 3: No kubectl ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/k8s-go.yaml" .gatekeeper.yaml
+sed -i.bak 's/my-project/test-project/' .gatekeeper.yaml && rm -f .gatekeeper.yaml.bak
+assert_contains "layer 3 skips without kubectl" "SKIP" "$PROJECT_DIR/bin/gate-keeper" run --layer=all
+rm -f .gatekeeper.yaml
+
+# --- Test: JSON output ---
+echo ""
+echo "── JSON Output ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+rm -rf .gate-audit
+"$PROJECT_DIR/bin/gate-keeper" run --layer=1 --format=json >/dev/null 2>&1 || true
+assert_contains "json audit has timestamp" "timestamp" cat .gate-audit/*.json
+assert_contains "json audit has checks array" "checks" cat .gate-audit/*.json
+assert_contains "json audit has git_sha" "git_sha" cat .gate-audit/*.json
+rm -rf .gate-audit .gatekeeper.yaml
+
+# --- Test: CI mode ---
+echo ""
+echo "── CI Mode ──"
+cd "$FIXTURES_DIR/good-project"
+cp "$PROJECT_DIR/templates/minimal.yaml" .gatekeeper.yaml
+rm -rf .gate-audit
+assert_pass "ci mode runs" "$PROJECT_DIR/bin/gate-keeper" run --layer=1 --ci
+rm -rf .gate-audit .gatekeeper.yaml
+
+# --- Test: Supervision (stamp / integrity) ---
+echo ""
+echo "── Supervision: Stamp & Integrity ──"
+cd "$FIXTURES_DIR/good-project"
+rm -f .gate-keeper.sha256
+
+# stamp generates hash file
+assert_pass "stamp generates hash file" "$PROJECT_DIR/bin/gate-keeper" stamp
+assert_pass "hash file created" test -f .gate-keeper.sha256
+
+# integrity verification passes on unmodified files
+assert_pass "stamp --verify passes on clean files" "$PROJECT_DIR/bin/gate-keeper" stamp --verify
+
+# tamper: append a byte to one of the lib files, then verify fails
+TMPBAK=$(cat "$PROJECT_DIR/lib/supervision.sh")
+echo "# tamper" >> "$PROJECT_DIR/lib/supervision.sh"
+assert_fail "stamp --verify fails after tampering" "$PROJECT_DIR/bin/gate-keeper" stamp --verify
+# restore
+echo "$TMPBAK" > "$PROJECT_DIR/lib/supervision.sh"
+
+rm -f .gate-keeper.sha256
 
 # --- Summary ---
 echo ""

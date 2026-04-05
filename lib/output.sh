@@ -32,6 +32,7 @@ gk_print_check() {
   case "$status" in
     PASS) printf "  ${GREEN}✓${RESET} [%s] %-35s ${GREEN}PASS${RESET}  (%sms)\n" "$id" "$name" "$duration" ;;
     FAIL) printf "  ${RED}✗${RESET} [%s] %-35s ${RED}FAIL${RESET}  (%sms)\n" "$id" "$name" "$duration" ;;
+    WARN) printf "  ${YELLOW}⚠${RESET} [%s] %-35s ${YELLOW}WARN${RESET}  (%sms)\n" "$id" "$name" "$duration" ;;
     *)    printf "  ${YELLOW}⊘${RESET} [%s] %-35s ${YELLOW}SKIP${RESET}\n" "$id" "$name" ;;
   esac
 }
@@ -43,13 +44,15 @@ gk_print_blocked() {
 
 gk_print_summary() {
   local total_ms="$1" audit_file="$2"
-  local total=$((GK_PASSED + GK_FAILED + GK_SKIPPED))
+  local total=$((GK_PASSED + GK_FAILED + GK_SKIPPED + GK_WARNINGS))
   echo ""
   echo "============================================"
-  if [ $GK_FAILED -eq 0 ]; then
-    echo -e "  ${GREEN}${BOLD}PASSED${RESET}: ${GK_PASSED}/${total} checks (${total_ms}ms)"
-  else
+  if [ $GK_FAILED -gt 0 ]; then
     echo -e "  ${RED}${BOLD}BLOCKED${RESET}: ${GK_FAILED} failed, ${GK_PASSED} passed (${total_ms}ms)"
+  elif [ $GK_WARNINGS -gt 0 ]; then
+    echo -e "  ${GREEN}${BOLD}PASSED${RESET}: ${GK_PASSED}/${total} checks, ${GK_WARNINGS} warning(s) (${total_ms}ms)"
+  else
+    echo -e "  ${GREEN}${BOLD}PASSED${RESET}: ${GK_PASSED}/${total} checks (${total_ms}ms)"
   fi
   echo "  Audit: $audit_file"
   echo "============================================"

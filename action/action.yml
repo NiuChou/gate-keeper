@@ -23,6 +23,13 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Verify integrity
+      shell: bash
+      run: |
+        GK_DIR="${{ github.action_path }}"
+        if [ -f ".gate-keeper.sha256" ]; then
+          "${GK_DIR}/../bin/gate-keeper" stamp --verify
+        fi
     - name: Run Gate Keeper
       id: run
       shell: bash
@@ -32,7 +39,7 @@ runs:
       run: |
         GK_DIR="${{ github.action_path }}"
         chmod +x "${GK_DIR}/../bin/gate-keeper"
-        
+
         # Run and capture exit code
         set +e
         "${GK_DIR}/../bin/gate-keeper" run \
@@ -41,7 +48,7 @@ runs:
           --ci
         EXIT_CODE=$?
         set -e
-        
+
         # Parse audit log for outputs
         AUDIT_FILE=$(ls -t .gate-audit/*.json 2>/dev/null | head -1)
         if [ -n "$AUDIT_FILE" ]; then
@@ -49,5 +56,5 @@ runs:
           echo "failed=$(grep '"failed"' "$AUDIT_FILE" | sed 's/.*: *//' | sed 's/,.*//')" >> "$GITHUB_OUTPUT"
           echo "verdict=$(grep '"verdict"' "$AUDIT_FILE" | sed 's/.*: *"//' | sed 's/".*//')" >> "$GITHUB_OUTPUT"
         fi
-        
+
         exit $EXIT_CODE

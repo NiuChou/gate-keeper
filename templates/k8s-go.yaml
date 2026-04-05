@@ -2,19 +2,37 @@ version: 1
 project: my-project
 namespace: production
 layer1:
-  go_work: true
-  shell_syntax: true
+  go_work:
+    enabled: true
+    severity: warning
+  shell_syntax:
+    enabled: true
+    severity: warning
   python_packaging: false
-  dockerfile_copy: true
-  dockerfile_antipatterns: true
-  secretref_ban: true
+  dockerfile_copy:
+    enabled: true
+    severity: warning
+  dockerfile_antipatterns:
+    enabled: true
+    severity: warning
+  secretref_ban:
+    enabled: true
+    severity: critical
+    exclude_pattern: "secretKeyRef"
   deprecated_refs:
     enabled: true
+    severity: warning
     patterns: []
-  port_chain: true
-  namespace_consistency: true
+  port_chain:
+    enabled: true
+    severity: critical
+  namespace_consistency:
+    enabled: true
+    severity: critical
+    expect: "production"
 layer2:
-  secret_name: "my-secret"  deployment_name_match: true
+  secret_name: "my-secret"
+  deployment_name_match: true
   image_name_match: true
   secret_key_match: true
 layer3:
@@ -27,3 +45,14 @@ audit:
 selfcheck:
   min_layer1_checks: 5
   min_layer2_checks: 3
+
+# Custom checks (uncomment and modify as needed):
+# custom_checks:
+#   - id: no_secretref
+#     description: "Ban bare secretRef"
+#     pattern: "secretRef"
+#     paths: "deploy/k8s"
+#     exclude_pattern: "secretKeyRef"
+#   - id: go_vet
+#     description: "Run go vet"
+#     command: "go vet ./..."

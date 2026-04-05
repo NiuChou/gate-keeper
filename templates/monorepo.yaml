@@ -14,7 +14,8 @@ layer1:
   port_chain: true
   namespace_consistency: true
 layer2:
-  secret_name: "my-secret"  deployment_name_match: true
+  secret_name: "my-secret"
+  deployment_name_match: true
   image_name_match: true
   secret_key_match: true
 layer3:
@@ -27,3 +28,13 @@ audit:
 selfcheck:
   min_layer1_checks: 5
   min_layer2_checks: 3
+
+# Custom checks (uncomment and modify as needed):
+# custom_checks:
+#   - id: no_cross_import
+#     description: "Ban cross-package imports"
+#     pattern: "from packages/"
+#     paths: "packages"
+#   - id: workspace_lint
+#     description: "Run workspace linter"
+#     command: "pnpm run lint --silent"

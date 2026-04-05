@@ -12,6 +12,7 @@ source "${LIB_DIR}/output.sh"
 source "${LIB_DIR}/layer1.sh"
 source "${LIB_DIR}/layer2.sh"
 source "${LIB_DIR}/layer3.sh"
+source "${LIB_DIR}/supervision.sh"
 
 COMMAND="${1:-run}"
 shift 2>/dev/null || true
@@ -19,8 +20,10 @@ shift 2>/dev/null || true
 case "$COMMAND" in
   init)    gk_init "$@" ;;
   run)     gk_run "$@" ;;
+  add)     gk_add "$@" ;;
   audit)   gk_audit "$@" ;;
   doctor)  gk_doctor "$@" ;;
+  stamp)   gk_stamp "$@" ;;
   version) echo "gate-keeper v${VERSION}" ;;
   help|--help|-h)
     echo "gate-keeper v${VERSION} — Three-layer deployment gatekeeper"
@@ -28,8 +31,10 @@ case "$COMMAND" in
     echo "Commands:"
     echo "  init      Detect project type, generate .gatekeeper.yaml"
     echo "  run       Execute checks (default)"
+    echo "  add       Add a custom check to .gatekeeper.yaml"
     echo "  audit     View audit log history"
     echo "  doctor    Self-check: verify checks are intact"
+    echo "  stamp     Generate SHA256 hash file for tamper detection"
     echo "  version   Show version"
     echo ""
     echo "Options for 'run':"
@@ -37,6 +42,13 @@ case "$COMMAND" in
     echo "  --config=PATH       Config file (default: .gatekeeper.yaml)"
     echo "  --format=text|json  Output format (default: text)"
     echo "  --ci                CI mode: strict, no colors"
+    echo ""
+    echo "Options for 'add':"
+    echo "  --id=ID             Check ID (required)"
+    echo "  --pattern=PATTERN   grep pattern to match (required)"
+    echo "  --paths=GLOB        Search path glob (default: .)"
+    echo "  --severity=critical|warning  Severity level (default: warning)"
+    echo "  --description=TEXT  Human-readable description"
     ;;
   *)
     echo "Unknown command: $COMMAND"
