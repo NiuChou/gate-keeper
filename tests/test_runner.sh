@@ -60,7 +60,7 @@ echo ""
 echo "── CLI Basics ──"
 assert_pass "version command" "$PROJECT_DIR/bin/gate-keeper" version
 assert_pass "help command" "$PROJECT_DIR/bin/gate-keeper" help
-assert_contains "version output" "v1.1.0" "$PROJECT_DIR/bin/gate-keeper" version
+assert_contains "version output" "v1.2.0" "$PROJECT_DIR/bin/gate-keeper" version
 
 # --- Test: Init ---
 echo ""
@@ -380,6 +380,166 @@ assert_fail "stamp --verify fails after tampering" "$PROJECT_DIR/bin/gate-keeper
 echo "$TMPBAK" > "$PROJECT_DIR/lib/supervision.sh"
 
 rm -f .gate-keeper.sha256
+
+# --- Test: Docker Compose template ---
+echo ""
+echo "── Docker Compose Template ──"
+cd "$FIXTURES_DIR/good-project"
+rm -f .gatekeeper.yaml
+assert_pass "init --type=docker-compose" "$PROJECT_DIR/bin/gate-keeper" init --type=docker-compose --force
+assert_pass "docker-compose config created" test -f .gatekeeper.yaml
+assert_contains "docker-compose has compose_healthcheck" "compose_healthcheck" cat .gatekeeper.yaml
+rm -f .gatekeeper.yaml
+
+# --- Test: .gatekeeperignore support ---
+echo ""
+echo "── .gatekeeperignore ──"
+cd "$FIXTURES_DIR/good-project"
+
+# Create a file that would normally match, inside a dir we want to ignore
+mkdir -p ignored_dir
+echo "password = 'secret123'" > ignored_dir/bad_code.py
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: no_secrets
+    pattern: "password.*=.*secret"
+    paths: "ignored_dir"
+    severity: critical
+YML
+
+# Without .gatekeeperignore it should fail
+assert_fail "pattern check finds match without ignore" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# With .gatekeeperignore it should pass
+echo "ignored_dir" > .gatekeeperignore
+assert_pass "pattern check passes with .gatekeeperignore" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf ignored_dir .gatekeeperignore .gatekeeper.yaml .gate-audit
+
+# --- Test: exclude_dirs in custom check ---
+echo ""
+echo "── exclude_dirs ──"
+cd "$FIXTURES_DIR/good-project"
+mkdir -p dist_dir src_dir
+echo "password = 'secret123'" > dist_dir/bundle.js
+echo "clean code here" > src_dir/app.py
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: no_secrets
+    pattern: "password.*=.*secret"
+    paths: "dist_dir src_dir"
+    exclude_dirs: "dist_dir"
+    severity: critical
+YML
+
+assert_pass "exclude_dirs filters out directory" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf dist_dir src_dir .gatekeeper.yaml .gate-audit
+
+# --- Test: fix_hint in custom check ---
+echo ""
+echo "── fix_hint ──"
+cd "$FIXTURES_DIR/good-project"
+mkdir -p hint_test
+echo "console.log('debug');" > hint_test/app.js
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: no_console
+    pattern: "console.log"
+    paths: "hint_test"
+    severity: warning
+    fix_hint: "Remove console.log before production."
+YML
+
+assert_contains "fix_hint appears in output" "Fix:" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -rf hint_test .gatekeeper.yaml .gate-audit
+
+# --- Test: Custom check with pipe in command (separator bug fix) ---
+echo ""
+echo "── Pipe in command (separator fix) ──"
+cd "$FIXTURES_DIR/good-project"
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: pipe_test
+    description: "Command with pipe should work"
+    command: "echo hello | grep hello"
+    severity: critical
+YML
+
+assert_pass "command with pipe works" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+rm -rf .gate-audit
+
+# --- Test: Audit --diff ---
+echo ""
+echo "── Audit Diff ──"
+cd "$FIXTURES_DIR/good-project"
+rm -rf .gate-audit
+
+# Run twice with different configs to produce different results
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: always_fail
+    command: "false"
+    severity: critical
+YML
+"$PROJECT_DIR/bin/gate-keeper" run --layer=1 >/dev/null 2>&1 || true
+sleep 1
+
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: test
+namespace: default
+layer1:
+  shell_syntax: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+custom_checks:
+  - id: always_pass
+    command: "true"
+    severity: critical
+YML
+"$PROJECT_DIR/bin/gate-keeper" run --layer=1 >/dev/null 2>&1 || true
+
+assert_contains "audit --diff shows changes" "Diff:" "$PROJECT_DIR/bin/gate-keeper" audit --diff
+rm -rf .gate-audit .gatekeeper.yaml
 
 # --- Summary ---
 echo ""

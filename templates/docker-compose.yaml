@@ -1,0 +1,55 @@
+version: 1
+project: my-project
+namespace: default
+layer1:
+  go_work: false
+  shell_syntax: true
+  python_packaging: true
+  dockerfile_copy: true
+  dockerfile_antipatterns: true
+  secretref_ban: false
+  deprecated_refs:
+    enabled: false
+  port_chain: false
+  namespace_consistency: false
+layer2:
+  deployment_name_match: false
+  image_name_match: false
+  secret_key_match: false
+layer3:
+  healthz: false
+  pod_status: false
+  load_test: false
+audit:
+  dir: .gate-audit/
+  retain_days: 30
+selfcheck:
+  min_layer1_checks: 3
+  min_layer2_checks: 0
+
+# Docker Compose specific checks
+custom_checks:
+  - id: compose_healthcheck
+    description: "Verify Docker Compose services have healthcheck defined"
+    command: "grep -L 'healthcheck:' docker-compose*.yml docker-compose*.yaml 2>/dev/null | head -5; test -z \"$(grep -L 'healthcheck:' docker-compose*.yml docker-compose*.yaml 2>/dev/null)\""
+    severity: warning
+    fix_hint: "Add a healthcheck block to each service in your docker-compose file."
+  - id: compose_restart_policy
+    description: "Verify Docker Compose services have restart policy"
+    command: "grep -L 'restart:' docker-compose*.yml docker-compose*.yaml 2>/dev/null | head -5; test -z \"$(grep -L 'restart:' docker-compose*.yml docker-compose*.yaml 2>/dev/null)\""
+    severity: warning
+    fix_hint: "Add 'restart: unless-stopped' or 'restart: always' to each service."
+  - id: no_hardcoded_secrets
+    description: "Scan for hardcoded passwords/secrets in source code"
+    pattern: "(password|secret|api_key|apikey|token)\\s*[:=]\\s*[\"'][^\"']{8,}"
+    paths: "."
+    exclude_pattern: "_test\\.|test_|\\.example|CHANGEME|REPLACE|placeholder"
+    exclude_dirs: "dist,node_modules,__pycache__,.venv,.git"
+    severity: critical
+    fix_hint: "Use environment variables or a .env file (excluded from git) for secrets."
+  - id: no_debug_production
+    description: "Forbid DEBUG=True in production compose files"
+    pattern: "DEBUG.*[Tt]rue"
+    paths: "docker-compose.prod.yml docker-compose.production.yml"
+    severity: critical
+    fix_hint: "Remove DEBUG=True from production config. Use LOG_LEVEL=INFO instead."

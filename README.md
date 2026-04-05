@@ -49,7 +49,7 @@ Each layer must pass before the next runs. Any critical failure blocks deploymen
 | E | Dockerfile 反模式 | 无 -e 安装、无 -dev 包 |
 | F | secretRef 禁用 | 禁止 secretRef 注入全部 key，必须逐个 secretKeyRef（支持 `exclude_pattern`） |
 | G | 废弃组件引用 | 检测已废弃的组件名（可自定义 patterns） |
-| H | 端口链一致性 | containerPort = probePort = targetPort |
+| H | 端口链一致性 | containerPort = probePort = targetPort（支持命名端口 / supports named ports） |
 | I | namespace 一致性 | 所有 YAML 的 namespace 必须一致（支持 `expect` 配置） |
 | * | 自定义检查 | 通过 `custom_checks` 配置 pattern 或 command |
 
@@ -88,6 +88,7 @@ gate-keeper run --layer=2       # Layer 1 + 2 (累积 / cumulative)
 gate-keeper run --ci            # CI 模式（无颜色，JSON 输出）
 gate-keeper audit               # 查看审计日志
 gate-keeper audit --last=10     # 最近 10 条
+gate-keeper audit --diff        # 对比最近两次运行的变化
 gate-keeper doctor              # 自检：配置、依赖、完整性、hash 验证
 gate-keeper add                 # 添加自定义检查项到配置
 gate-keeper stamp               # 生成 SHA256 hash 文件（篡改检测基线）
@@ -219,6 +220,8 @@ layer1:
       paths: "src/**/*.ts"
       severity: warning
       description: "Ban console.log"
+      exclude_dirs: "dist,node_modules"    # 排除目录 / Exclude directories
+      fix_hint: "Remove console.log before production."  # 修复建议 / Fix suggestion
     - id: lint_check
       command: "npm run lint --silent"
       description: "Run linter"
@@ -240,7 +243,22 @@ layer3:
 | k8s-python | K8s + Python 项目 |
 | nextjs | Next.js 项目 |
 | monorepo | Monorepo 项目 |
+| docker-compose | Docker Compose 项目 |
 | minimal | 最小配置 |
+
+### .gatekeeperignore
+
+类似 `.gitignore`，全局排除目录和文件，避免每条规则重复配置：
+
+Like `.gitignore`, globally exclude directories/files from all pattern checks:
+
+```
+# .gatekeeperignore
+dist/
+node_modules/
+__pycache__/
+*.min.js
+```
 
 ---
 
@@ -270,7 +288,7 @@ Verdict 取值 / Verdict values: `PASSED` | `WARNED` | `BLOCKED`
 
 ```
 ============================================
-  Gate Keeper v1.1.0 · perseworks
+  Gate Keeper v1.2.0 · perseworks
 ============================================
 
 ── Layer 1: Static Checks ──

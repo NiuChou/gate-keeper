@@ -3,9 +3,10 @@
 # https://github.com/NiuChou/gate-keeper
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
+TEMPLATE_DIR="${TEMPLATE_DIR:-${SCRIPT_DIR}/../templates}"
 
 source "${LIB_DIR}/core.sh"
 source "${LIB_DIR}/output.sh"
@@ -42,6 +43,10 @@ case "$COMMAND" in
     echo "  --config=PATH       Config file (default: .gatekeeper.yaml)"
     echo "  --format=text|json  Output format (default: text)"
     echo "  --ci                CI mode: strict, no colors"
+    echo ""
+    echo "Options for 'audit':"
+    echo "  --last=N            Show last N logs (default: 5)"
+    echo "  --diff              Compare two most recent audit runs"
     echo ""
     echo "Options for 'add':"
     echo "  --id=ID             Check ID (required)"

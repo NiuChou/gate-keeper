@@ -149,6 +149,13 @@ gk_run_check() {
 
   gk_record "$id" "$name" "$status" "$output" "$duration" "$severity"
   gk_print_check "$id" "$name" "$status" "$duration"
+
+  # Print details on failure/warning (includes fix_hint if present)
+  if [ "$status" = "FAIL" ] || [ "$status" = "WARN" ]; then
+    if [ -n "$output" ]; then
+      echo "$output" | head -8 | sed 's/^/    /'
+    fi
+  fi
 }
 
 # Skip a check with SKIP status
@@ -274,6 +281,8 @@ gk_init() {
     template="nextjs"
   elif [ -f "pnpm-workspace.yaml" ]; then
     template="monorepo"
+  elif ls docker-compose*.yml docker-compose*.yaml 1>/dev/null 2>&1; then
+    template="docker-compose"
   fi
 
   for arg in "$@"; do
@@ -288,7 +297,7 @@ gk_init() {
     exit 1
   fi
 
-  local template_dir="${SCRIPT_DIR}/../templates"
+  local template_dir="${TEMPLATE_DIR:-${SCRIPT_DIR}/../templates}"
   if [ -f "${template_dir}/${template}.yaml" ]; then
     cp "${template_dir}/${template}.yaml" .gatekeeper.yaml
     echo "Generated .gatekeeper.yaml from template: $template"
@@ -303,13 +312,22 @@ gk_init() {
 # L-4 Fix: Use process substitution instead of pipe
 gk_audit() {
   local count=5
+  local diff_mode=false
   for arg in "$@"; do
-    case "$arg" in --last=*) count="${arg#*=}" ;; esac
+    case "$arg" in
+      --last=*) count="${arg#*=}" ;;
+      --diff)   diff_mode=true ;;
+    esac
   done
 
   if [ ! -d "$GK_AUDIT_DIR" ]; then
     echo "No audit logs found at $GK_AUDIT_DIR"
     return 0
+  fi
+
+  if [ "$diff_mode" = true ]; then
+    gk_audit_diff
+    return $?
   fi
 
   echo "Last $count audit logs:"
@@ -322,6 +340,60 @@ gk_audit() {
     local ts=$(basename "$f" .json)
     printf "  %s  %-8s (passed: %s, failed: %s)\n" "$ts" "$verdict" "$passed" "$failed"
   done < <(ls -t "$GK_AUDIT_DIR"/*.json 2>/dev/null | head -n "$count")
+}
+
+# Compare the two most recent audit logs
+gk_audit_diff() {
+  local files=()
+  while read -r f; do
+    [ -n "$f" ] && files+=("$f")
+  done < <(ls -t "$GK_AUDIT_DIR"/*.json 2>/dev/null | head -n 2)
+
+  if [ ${#files[@]} -lt 2 ]; then
+    echo "Need at least 2 audit logs for diff. Found: ${#files[@]}"
+    return 1
+  fi
+
+  local newer="${files[0]}"
+  local older="${files[1]}"
+  local ts_new=$(basename "$newer" .json)
+  local ts_old=$(basename "$older" .json)
+
+  echo "Diff: $ts_old → $ts_new"
+  echo ""
+
+  # Extract check statuses from both files using awk
+  # Format: id:status per line
+  local old_checks new_checks
+  old_checks=$(awk -F'"' '/"id"/{id=$4} /"status"/{st=$4; print id":"st}' "$older")
+  new_checks=$(awk -F'"' '/"id"/{id=$4} /"status"/{st=$4; print id":"st}' "$newer")
+
+  local has_changes=false
+
+  # Find changes
+  while IFS=: read -r new_id new_status; do
+    [ -z "$new_id" ] && continue
+    local old_status=""
+    old_status=$(echo "$old_checks" | grep "^${new_id}:" | head -1 | cut -d: -f2)
+    if [ -z "$old_status" ]; then
+      printf "  [%s] %-30s (new) → %s\n" "$new_id" "" "$new_status"
+      has_changes=true
+    elif [ "$old_status" != "$new_status" ]; then
+      local arrow="→"
+      local indicator=""
+      if [ "$new_status" = "PASS" ] && [ "$old_status" = "FAIL" ]; then
+        indicator=" ✅"
+      elif [ "$new_status" = "FAIL" ] && [ "$old_status" = "PASS" ]; then
+        indicator=" ❌"
+      fi
+      printf "  [%s] %s %s %s%s\n" "$new_id" "$old_status" "$arrow" "$new_status" "$indicator"
+      has_changes=true
+    fi
+  done <<< "$new_checks"
+
+  if [ "$has_changes" = false ]; then
+    echo "  No changes between runs."
+  fi
 }
 
 gk_add() {

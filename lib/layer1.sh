@@ -140,17 +140,48 @@ gk_check_port_chain() {
   [ -z "$k8s_dir" ] && return 0
   local errors=0
   while IFS= read -r f; do
-    local container_port=$(grep 'containerPort:' "$f" 2>/dev/null | head -1 | awk '{print $2}')
+    # Extract containerPort value using sed for precision
+    local container_port=$(sed -n 's/^[[:space:]]*containerPort:[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '[:space:]')
     [ -z "$container_port" ] && continue
-    local liveness_port=$(awk '/livenessProbe:/{p=1} p && /port:/{print $2; p=0}' "$f" 2>/dev/null | head -1)
-    if [ -n "$liveness_port" ] && [ "$liveness_port" != "$container_port" ]; then
-      echo "$f: containerPort=$container_port livenessProbe=$liveness_port"
-      ((errors++)) || true
+
+    # Extract container port name (e.g. "name: http" under the ports block)
+    local container_port_name=$(awk '
+      /containerPort:/{found=1; next}
+      found && /name:/{print $2; exit}
+      found && /^[[:space:]]*[a-zA-Z]/ && !/name:/{exit}
+    ' "$f" 2>/dev/null | tr -d '[:space:]')
+
+    # Check liveness probe port
+    local liveness_port=$(awk '/livenessProbe:/{p=1} p && /port:/{
+      val=$2; gsub(/[[:space:]]/,"",val); print val; p=0
+    }' "$f" 2>/dev/null | head -1)
+    if [ -n "$liveness_port" ]; then
+      # Named port: match against container port name
+      if [[ "$liveness_port" =~ ^[a-zA-Z] ]]; then
+        if [ -n "$container_port_name" ] && [ "$liveness_port" != "$container_port_name" ]; then
+          echo "$f: containerPort name=$container_port_name livenessProbe port=$liveness_port"
+          ((errors++)) || true
+        fi
+      elif [ "$liveness_port" != "$container_port" ]; then
+        echo "$f: containerPort=$container_port livenessProbe=$liveness_port"
+        ((errors++)) || true
+      fi
     fi
-    local readiness_port=$(awk '/readinessProbe:/{p=1} p && /port:/{print $2; p=0}' "$f" 2>/dev/null | head -1)
-    if [ -n "$readiness_port" ] && [ "$readiness_port" != "$container_port" ]; then
-      echo "$f: containerPort=$container_port readinessProbe=$readiness_port"
-      ((errors++)) || true
+
+    # Check readiness probe port
+    local readiness_port=$(awk '/readinessProbe:/{p=1} p && /port:/{
+      val=$2; gsub(/[[:space:]]/,"",val); print val; p=0
+    }' "$f" 2>/dev/null | head -1)
+    if [ -n "$readiness_port" ]; then
+      if [[ "$readiness_port" =~ ^[a-zA-Z] ]]; then
+        if [ -n "$container_port_name" ] && [ "$readiness_port" != "$container_port_name" ]; then
+          echo "$f: containerPort name=$container_port_name readinessProbe port=$readiness_port"
+          ((errors++)) || true
+        fi
+      elif [ "$readiness_port" != "$container_port" ]; then
+        echo "$f: containerPort=$container_port readinessProbe=$readiness_port"
+        ((errors++)) || true
+      fi
     fi
   done < <(find "$k8s_dir" -name '*.yaml' 2>/dev/null)
   [ $errors -eq 0 ] || return 1
@@ -190,28 +221,32 @@ gk_run_custom_checks() {
 
   # Parse custom_checks items from config using awk
   # Supports both "  custom_checks:" (layer1 sub-section) and "custom_checks:" (top-level)
-  # Output format per item: id|pattern|paths|severity|command|exclude
+  # Output format per item: fields separated by ASCII Unit Separator (0x1f)
+  # Fields: id, pattern, paths, severity, command, exclude, exclude_dirs, fix_hint
+  local SEP=$'\x1f'
   local items
-  items=$(awk '
+  items=$(awk -v sep="$SEP" '
     /^  custom_checks:/ { in_cc=1; next }
     /^custom_checks:/ { in_cc=1; next }
     in_cc && /^[a-zA-Z]/ { in_cc=0 }
     in_cc && /^[[:space:]]*- id:/ {
-      if (id != "") print id "|" pat "|" pths "|" sev "|" cmd "|" excl
-      id=$NF; pat=""; pths="."; sev="critical"; cmd=""; excl=""
+      if (id != "") print id sep pat sep pths sep sev sep cmd sep excl sep exdirs sep hint
+      id=$NF; pat=""; pths="."; sev="critical"; cmd=""; excl=""; exdirs=""; hint=""
     }
     in_cc && /^[[:space:]]*pattern:/ { gsub(/^[[:space:]]*pattern:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); pat=$0 }
     in_cc && /^[[:space:]]*paths:/ { gsub(/^[[:space:]]*paths:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); gsub(/[\[\]]/,""); gsub(/,/," "); pths=$0 }
     in_cc && /^[[:space:]]*severity:/ { sev=$NF }
     in_cc && /^[[:space:]]*command:/ { gsub(/^[[:space:]]*command:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); cmd=$0 }
     in_cc && /^[[:space:]]*exclude_pattern:/ { gsub(/^[[:space:]]*exclude_pattern:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); excl=$0 }
-    END { if (id != "") print id "|" pat "|" pths "|" sev "|" cmd "|" excl }
+    in_cc && /^[[:space:]]*exclude_dirs:/ { gsub(/^[[:space:]]*exclude_dirs:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); exdirs=$0 }
+    in_cc && /^[[:space:]]*fix_hint:/ { gsub(/^[[:space:]]*fix_hint:[[:space:]]*/,""); gsub(/^"/,""); gsub(/"$/,""); hint=$0 }
+    END { if (id != "") print id sep pat sep pths sep sev sep cmd sep excl sep exdirs sep hint }
   ' "$GK_CONFIG" 2>/dev/null)
 
   [ -z "$items" ] && return 0
 
   local idx=0
-  while IFS='|' read -r check_id check_pattern check_paths check_severity check_command check_exclude; do
+  while IFS="$SEP" read -r check_id check_pattern check_paths check_severity check_command check_exclude check_exclude_dirs check_fix_hint; do
     [ -z "$check_id" ] && continue
     idx=$((idx + 1))
     local label="custom-${idx}"
@@ -221,26 +256,62 @@ gk_run_custom_checks() {
       gk_run_check "$label" "$name" "$check_severity" bash -c "$check_command"
     elif [ -n "$check_pattern" ]; then
       gk_run_check "$label" "$name" "$check_severity" \
-        _gk_pattern_check "$check_pattern" "$check_paths" "$check_exclude"
+        _gk_pattern_check "$check_pattern" "$check_paths" "$check_exclude" "$check_exclude_dirs" "$check_fix_hint"
     fi
   done <<< "$items"
 }
 
 # Execute a grep-based pattern check; exits non-zero if pattern found
+# Args: pattern, paths, exclude_pattern, exclude_dirs, fix_hint
 _gk_pattern_check() {
-  local pattern="$1" paths="${2:-.}" exclude="$3"
+  local pattern="$1" paths="${2:-.}" exclude="${3:-}" exclude_dirs="${4:-}" fix_hint="${5:-}"
   local errors=0
+
+  # Build exclude-dir arguments from: explicit exclude_dirs + .gatekeeperignore + defaults
+  local -a grep_args=()
+  local default_excludes="node_modules .next dist build vendor .git __pycache__ .venv"
+
+  # Add default excludes
+  for d in $default_excludes; do
+    grep_args+=(--exclude-dir="$d")
+  done
+
+  # Add per-check exclude_dirs (comma or space separated)
+  if [ -n "$exclude_dirs" ]; then
+    local cleaned="${exclude_dirs//,/ }"
+    for d in $cleaned; do
+      grep_args+=(--exclude-dir="$d")
+    done
+  fi
+
+  # Add .gatekeeperignore entries
+  if [ -f ".gatekeeperignore" ]; then
+    while IFS= read -r line; do
+      line="${line%%#*}"                 # strip comments
+      line="${line%/}"                   # strip trailing slash
+      line=$(echo "$line" | tr -d '[:space:]')
+      [ -z "$line" ] && continue
+      if [[ "$line" == *.* ]] && [[ "$line" != */* ]]; then
+        grep_args+=(--exclude="$line")   # file glob like *.min.js
+      else
+        grep_args+=(--exclude-dir="$line")
+      fi
+    done < ".gatekeeperignore"
+  fi
 
   for p in $paths; do
     local found=""
     if [ -n "$exclude" ]; then
-      found=$(grep -rn "$pattern" $p 2>/dev/null | grep -v "$exclude" | grep -v '#' || true)
+      found=$(grep -rn "${grep_args[@]}" "$pattern" $p 2>/dev/null | grep -v "$exclude" | grep -v '#' || true)
     else
-      found=$(grep -rn "$pattern" $p 2>/dev/null | grep -v '#' || true)
+      found=$(grep -rn "${grep_args[@]}" "$pattern" $p 2>/dev/null | grep -v '#' || true)
     fi
     if [ -n "$found" ]; then
       echo "Pattern '$pattern' found:"
       echo "$found" | head -5
+      if [ -n "$fix_hint" ]; then
+        echo "  Fix: $fix_hint"
+      fi
       ((errors++)) || true
     fi
   done
