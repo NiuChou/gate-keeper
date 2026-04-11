@@ -15,6 +15,13 @@ gk_layer1_run() {
       "G|Deprecated component refs|deprecated_refs|gk_check_deprecated_refs"
       "H|Port chain consistency|port_chain|gk_check_port_chain"
       "I|Namespace consistency|namespace_consistency|gk_check_namespace_consistency"
+      "DC-1|.env multi-line value detection|dc_env_multiline|gk_check_dc_env_multiline"
+      "DC-2|Compose env var completeness|dc_env_completeness|gk_check_dc_env_completeness"
+      "DC-3|Healthcheck anti-patterns|dc_healthcheck_antipatterns|gk_check_dc_healthcheck_antipatterns"
+      "DC-4|tmpfs vs Dockerfile mkdir conflict|dc_tmpfs_shadow|gk_check_dc_tmpfs_shadow"
+      "DC-5|cap_drop ALL on middleware|dc_cap_drop_all|gk_check_dc_cap_drop_all"
+      "DC-6|depends_on deadlock detection|dc_depends_on_deadlock|gk_check_dc_depends_on_deadlock"
+      "DC-7|Resource limit sanity|dc_resource_limits|gk_check_dc_resource_limits"
     )
     for def in "${check_defs[@]}"; do
       local id="${def%%|*}"; local rest="${def#*|}"
@@ -45,6 +52,14 @@ gk_layer1_run() {
   gk_maybe_run "G" "Deprecated component refs" "deprecated_refs" gk_check_deprecated_refs
   gk_maybe_run "H" "Port chain consistency" "port_chain" gk_check_port_chain
   gk_maybe_run "I" "Namespace consistency" "namespace_consistency" gk_check_namespace_consistency
+  # Docker Compose checks
+  gk_maybe_run "DC-1" ".env multi-line value detection" "dc_env_multiline" gk_check_dc_env_multiline
+  gk_maybe_run "DC-2" "Compose env var completeness" "dc_env_completeness" gk_check_dc_env_completeness
+  gk_maybe_run "DC-3" "Healthcheck anti-patterns" "dc_healthcheck_antipatterns" gk_check_dc_healthcheck_antipatterns
+  gk_maybe_run "DC-4" "tmpfs vs Dockerfile mkdir conflict" "dc_tmpfs_shadow" gk_check_dc_tmpfs_shadow
+  gk_maybe_run "DC-5" "cap_drop ALL on middleware" "dc_cap_drop_all" gk_check_dc_cap_drop_all
+  gk_maybe_run "DC-6" "depends_on deadlock detection" "dc_depends_on_deadlock" gk_check_dc_depends_on_deadlock
+  gk_maybe_run "DC-7" "Resource limit sanity" "dc_resource_limits" gk_check_dc_resource_limits
   gk_run_custom_checks
 }
 
@@ -273,6 +288,232 @@ gk_find_k8s_dir() {
   for d in deploy/k8s k8s kubernetes .k8s; do
     [ -d "$d" ] && echo "$d" && return
   done
+}
+
+gk_find_compose_files() {
+  find . -maxdepth 2 \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+    -o -name 'compose*.yml' -o -name 'compose*.yaml' \) \
+    -not -path '*/.git/*' -not -path '*/node_modules/*' 2>/dev/null
+}
+
+gk_check_dc_env_multiline() {
+  local compose_files
+  compose_files=$(gk_find_compose_files)
+  [ -z "$compose_files" ] && return 0
+  local errors=0
+  for env_file in .env .env.*; do
+    [ -f "$env_file" ] || continue
+    if grep -qE 'BEGIN (CERTIFICATE|PRIVATE KEY|RSA|EC|PUBLIC KEY)' "$env_file" 2>/dev/null; then
+      echo "$env_file: contains PEM/certificate content (multi-line values not supported in Docker Compose .env)"
+      echo "  Fix: Use _FILE suffix pattern with volume mounts instead of storing multi-line keys in .env"
+      ((errors++)) || true
+    fi
+  done
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+gk_check_dc_env_completeness() {
+  local compose_files
+  compose_files=$(gk_find_compose_files)
+  [ -z "$compose_files" ] && return 0
+  [ -f ".env" ] || return 0
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    while IFS= read -r var_ref; do
+      local var_name="${var_ref#\$\{}"
+      var_name="${var_name%\}}"
+      # Skip vars with defaults (${VAR:-default} or ${VAR-default})
+      echo "$var_ref" | grep -qE '\$\{[^}]*:-|\$\{[^}]*-' && continue
+      if ! grep -qE "^${var_name}=" ".env" 2>/dev/null; then
+        echo "$f: variable '\${${var_name}}' not found in .env"
+        ((errors++)) || true
+      fi
+    done < <(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "$f" 2>/dev/null || true)
+  done <<< "$compose_files"
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+gk_check_dc_healthcheck_antipatterns() {
+  local compose_files
+  compose_files=$(gk_find_compose_files)
+  [ -z "$compose_files" ] && return 0
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    # Anti-pattern 1: TLS healthcheck on localhost
+    if grep -n 'https://localhost\|https://127\.0\.0\.1' "$f" 2>/dev/null | grep -qi 'healthcheck\|test\|curl\|wget'; then
+      echo "$f: healthcheck uses HTTPS on localhost (TLS SNI will fail)"
+      echo "  Fix: Use TCP probe (nc -z 127.0.0.1 PORT) or plain HTTP"
+      ((errors++)) || true
+    fi
+    # Anti-pattern 2: pgrep -x with long process names
+    local pgrep_matches
+    pgrep_matches=$(grep -oE 'pgrep -x [a-zA-Z0-9_-]+' "$f" 2>/dev/null || true)
+    if [ -n "$pgrep_matches" ]; then
+      while IFS= read -r match; do
+        local procname="${match#pgrep -x }"
+        if [ ${#procname} -gt 15 ]; then
+          echo "$f: pgrep -x '$procname' (${#procname} chars > 15 char Linux limit)"
+          echo "  Fix: Use 'pgrep -f $procname' instead (-f matches full cmdline)"
+          ((errors++)) || true
+        fi
+      done <<< "$pgrep_matches"
+    fi
+  done <<< "$compose_files"
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+gk_check_dc_tmpfs_shadow() {
+  local compose_files
+  compose_files=$(gk_find_compose_files)
+  [ -z "$compose_files" ] && return 0
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    local dir
+    dir=$(dirname "$f")
+    local tmpfs_paths
+    tmpfs_paths=$(awk '/tmpfs:/{in_t=1; next} in_t && /^[[:space:]]*-[[:space:]]*\//{gsub(/^[[:space:]]*-[[:space:]]*/,""); print; next} in_t && /^[[:space:]]*[a-zA-Z]/{in_t=0}' "$f" 2>/dev/null || true)
+    [ -z "$tmpfs_paths" ] && continue
+    while IFS= read -r df; do
+      [ -f "$df" ] || continue
+      local mkdir_paths
+      mkdir_paths=$(grep -oE 'mkdir -p [^ ]+' "$df" 2>/dev/null | awk '{print $3}' || true)
+      [ -z "$mkdir_paths" ] && continue
+      while IFS= read -r tpath; do
+        while IFS= read -r mpath; do
+          if [ "$tpath" = "$mpath" ]; then
+            echo "$f: tmpfs mount '$tpath' shadows Dockerfile mkdir in $df"
+            ((errors++)) || true
+          fi
+        done <<< "$mkdir_paths"
+      done <<< "$tmpfs_paths"
+    done < <(find "$dir" -maxdepth 2 -name 'Dockerfile*' 2>/dev/null)
+  done <<< "$compose_files"
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+gk_check_dc_cap_drop_all() {
+  local compose_files
+  compose_files=$(gk_find_compose_files)
+  [ -z "$compose_files" ] && return 0
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    local result
+    result=$(awk '
+      /^[[:space:]]+[a-zA-Z0-9_-]+:/ && !/image:|command:|volumes:|ports:|environment:|depends_on:|networks:|healthcheck:|cap_drop:|cap_add:/ {
+        svc=$1; gsub(/:$/,"",svc); img=""; cap_drop_all=0
+      }
+      /image:/ { img=$2 }
+      /cap_drop:/ { in_cap=1; next }
+      in_cap && /- ALL/ { cap_drop_all=1; in_cap=0 }
+      in_cap && /^[[:space:]]*[a-zA-Z]/ { in_cap=0 }
+      cap_drop_all && img ~ /postgres|redis|mysql|mongo|mariadb/ {
+        print FILENAME ": service uses cap_drop ALL on " img " (may break DB operations)"
+        cap_drop_all=0
+      }
+    ' "$f" 2>/dev/null || true)
+    if [ -n "$result" ]; then
+      echo "$result"
+      ((errors++)) || true
+    fi
+  done <<< "$compose_files"
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+gk_check_dc_depends_on_deadlock() {
+  local compose_files
+  compose_files=$(gk_find_compose_files)
+  [ -z "$compose_files" ] && return 0
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    # Extract depends_on relationships: "svc dep" pairs
+    local deps
+    deps=$(awk '
+      /^[[:space:]]{2}[a-zA-Z0-9_-]+:/ && !/image:|command:|volumes:|ports:|environment:|networks:|healthcheck:|cap_drop:|depends_on:/ {
+        svc=$1; gsub(/:$/,"",svc)
+      }
+      /depends_on:/ { in_dep=1; next }
+      in_dep && /^[[:space:]]*-[[:space:]]*[a-zA-Z]/ { dep=$2; print svc " " dep }
+      in_dep && /^[[:space:]]{4}[a-zA-Z]/ { dep=$1; gsub(/:$/,"",dep); print svc " " dep }
+      in_dep && /^[[:space:]]{2}[a-zA-Z]/ { in_dep=0 }
+    ' "$f" 2>/dev/null || true)
+    [ -z "$deps" ] && continue
+    # Check for cycles: for each service, walk deps up to depth 20
+    local services
+    services=$(echo "$deps" | awk '{print $1}' | sort -u)
+    while IFS= read -r start; do
+      local visited="$start"
+      local current="$start"
+      local depth=0
+      local cycle=false
+      while [ $depth -lt 20 ]; do
+        local next
+        next=$(echo "$deps" | awk -v s="$current" '$1==s{print $2; exit}')
+        [ -z "$next" ] && break
+        if echo "$visited" | grep -qw "$next"; then
+          echo "$f: circular depends_on detected: $visited -> $next"
+          cycle=true
+          break
+        fi
+        visited="$visited -> $next"
+        current="$next"
+        ((depth++)) || true
+      done
+      if [ "$cycle" = true ]; then
+        ((errors++)) || true
+        break
+      fi
+    done <<< "$services"
+  done <<< "$compose_files"
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+gk_check_dc_resource_limits() {
+  local compose_files
+  compose_files=$(gk_find_compose_files)
+  [ -z "$compose_files" ] && return 0
+  local per_worker_mb
+  per_worker_mb=$(gk_config_value "dc_resource_limits.per_worker_mb" "128")
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    local result
+    result=$(awk -v pwmb="$per_worker_mb" '
+      /^[[:space:]]{2}[a-zA-Z0-9_-]+:/ && !/image:|command:|volumes:|ports:|environment:|networks:|healthcheck:|cap_drop:|depends_on:|mem_limit:|memory:/ {
+        svc=$1; gsub(/:$/,"",svc); workers=0; mem_mb=0
+      }
+      /--workers[[:space:]]/ { match($0, /--workers[[:space:]]+([0-9]+)/, a); if (a[1]>0) workers=a[1]+0 }
+      /mem_limit:|memory:/ {
+        val=$2
+        if (val ~ /[gG]$/) { sub(/[gG]$/,"",val); mem_mb=val*1024 }
+        else if (val ~ /[mM]$/) { sub(/[mM]$/,"",val); mem_mb=val+0 }
+        else mem_mb=val/1024/1024
+      }
+      workers>0 && mem_mb>0 {
+        need=workers*pwmb*1.5
+        if (mem_mb < need) {
+          printf "%s: service %s has %d workers but only %dMB limit (need >= %dMB at %dMB/worker)\n", FILENAME, svc, workers, mem_mb, need, pwmb
+        }
+        workers=0; mem_mb=0
+      }
+    ' "$f" 2>/dev/null || true)
+    if [ -n "$result" ]; then
+      echo "$result"
+      ((errors++)) || true
+    fi
+  done <<< "$compose_files"
+  [ $errors -eq 0 ] || return 1
+  return 0
 }
 
 # Run user-defined custom checks from custom_checks section of .gatekeeper.yaml

@@ -1,0 +1,11 @@
+version: "3.8"
+services:
+  postgres:
+    image: postgres:16
+    cap_drop:
+      - ALL
+
+  redis:
+    image: redis:7-alpine
+    cap_drop:
+      - ALL

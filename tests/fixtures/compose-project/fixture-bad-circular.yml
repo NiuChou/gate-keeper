@@ -1,0 +1,11 @@
+version: "3.8"
+services:
+  app:
+    image: myapp:latest
+    depends_on:
+      - worker
+
+  worker:
+    image: myworker:latest
+    depends_on:
+      - app

@@ -13,6 +13,13 @@ layer1:
     patterns: []
   port_chain: true
   namespace_consistency: true
+  dc_env_multiline: false
+  dc_env_completeness: false
+  dc_healthcheck_antipatterns: false
+  dc_tmpfs_shadow: false
+  dc_cap_drop_all: false
+  dc_depends_on_deadlock: false
+  dc_resource_limits: false
 layer2:
   secret_name: "my-secret"
   deployment_name_match: true

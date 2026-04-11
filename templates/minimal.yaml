@@ -12,6 +12,13 @@ layer1:
     enabled: false
   port_chain: false
   namespace_consistency: false
+  dc_env_multiline: false
+  dc_env_completeness: false
+  dc_healthcheck_antipatterns: false
+  dc_tmpfs_shadow: false
+  dc_cap_drop_all: false
+  dc_depends_on_deadlock: false
+  dc_resource_limits: false
 layer2:
   deployment_name_match: false
   image_name_match: false

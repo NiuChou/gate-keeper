@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  app:
+    build: .
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      MISSING_VAR: ${NONEXISTENT_SECRET}
+      ALSO_MISSING: ${ANOTHER_MISSING_VAR}
+      HAS_DEFAULT: ${OPTIONAL_VAR:-default_value}

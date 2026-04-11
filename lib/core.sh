@@ -278,7 +278,7 @@ gk_dry_run_preview() {
 
   if [ "$run_l1" = true ]; then
     echo "  Layer 1: Static Checks"
-    for check in A:go_work B:shell_syntax C:python_packaging D:dockerfile_copy E:dockerfile_antipatterns F:secretref_ban G:deprecated_refs H:port_chain I:namespace_consistency; do
+    for check in A:go_work B:shell_syntax C:python_packaging D:dockerfile_copy E:dockerfile_antipatterns F:secretref_ban G:deprecated_refs H:port_chain I:namespace_consistency DC-1:dc_env_multiline DC-2:dc_env_completeness DC-3:dc_healthcheck_antipatterns DC-4:dc_tmpfs_shadow DC-5:dc_cap_drop_all DC-6:dc_depends_on_deadlock DC-7:dc_resource_limits; do
       local id="${check%%:*}" key="${check#*:}"
       local enabled=$(gk_config_enabled "$key")
       local sev=$(gk_config_value "${key}.severity" "critical")

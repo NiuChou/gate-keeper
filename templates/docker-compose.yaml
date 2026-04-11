@@ -12,6 +12,28 @@ layer1:
     enabled: false
   port_chain: false
   namespace_consistency: false
+  dc_env_multiline:
+    enabled: true
+    severity: critical
+  dc_env_completeness:
+    enabled: true
+    severity: critical
+  dc_healthcheck_antipatterns:
+    enabled: true
+    severity: high
+  dc_tmpfs_shadow:
+    enabled: true
+    severity: high
+  dc_cap_drop_all:
+    enabled: true
+    severity: warning
+  dc_depends_on_deadlock:
+    enabled: true
+    severity: warning
+  dc_resource_limits:
+    enabled: true
+    severity: warning
+    per_worker_mb: 128
 layer2:
   deployment_name_match: false
   image_name_match: false
@@ -53,3 +75,14 @@ custom_checks:
     paths: "docker-compose.prod.yml docker-compose.production.yml"
     severity: critical
     fix_hint: "Remove DEBUG=True from production config. Use LOG_LEVEL=INFO instead."
+  - id: dsn_protocol_consistency
+    description: "Detect asyncpg DSN protocol in shared env vars"
+    pattern: "postgresql\\+asyncpg://"
+    paths: ". .env"
+    severity: warning
+    fix_hint: "Native asyncpg uses 'postgresql://', not 'postgresql+asyncpg://'. Override per-service if sharing DATABASE_URL."
+  - id: pem_file_permissions
+    description: "Verify PEM/key/cert file permissions are not too open"
+    command: "bad_perms=0; for f in $(find . -maxdepth 3 \\( -name '*.pem' -o -name '*.key' -o -name '*.crt' \\) -not -path '*/.git/*' 2>/dev/null); do p=$(stat -f '%Lp' \"$f\" 2>/dev/null || stat -c '%a' \"$f\" 2>/dev/null); case \"$p\" in 600|400|644|640) ;; *) echo \"$f: permission $p (expected 600/644)\"; bad_perms=1 ;; esac; done; [ $bad_perms -eq 0 ]"
+    severity: warning
+    fix_hint: "chmod 600 or chmod 644 for PEM/key/cert files."

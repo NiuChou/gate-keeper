@@ -1047,6 +1047,133 @@ rm -rf .gate-plugins
 assert_contains "plugin list shows no plugins" "No plugins" "$PROJECT_DIR/bin/gate-keeper" plugin list
 rm -rf .gate-plugins
 
+# --- Test: Docker Compose Checks ---
+echo ""
+echo "── Docker Compose Checks ──"
+
+# Setup: go to compose fixture
+cd "$FIXTURES_DIR/compose-project"
+
+# Create config enabling all DC checks
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: compose-test
+namespace: default
+layer1:
+  go_work: false
+  shell_syntax: false
+  python_packaging: false
+  dockerfile_copy: false
+  dockerfile_antipatterns: false
+  secretref_ban: false
+  deprecated_refs: false
+  port_chain: false
+  namespace_consistency: false
+  dc_env_multiline:
+    enabled: true
+    severity: critical
+  dc_env_completeness:
+    enabled: true
+    severity: critical
+  dc_healthcheck_antipatterns:
+    enabled: true
+    severity: high
+  dc_tmpfs_shadow:
+    enabled: true
+    severity: high
+  dc_cap_drop_all:
+    enabled: true
+    severity: warning
+  dc_depends_on_deadlock:
+    enabled: true
+    severity: warning
+  dc_resource_limits:
+    enabled: true
+    severity: warning
+    per_worker_mb: 128
+layer2:
+  deployment_name_match: false
+  image_name_match: false
+  secret_key_match: false
+layer3:
+  healthz: false
+  pod_status: false
+  load_test: false
+YML
+
+# DC-1: .env multi-line detection
+assert_pass "DC-1 passes with clean .env" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# DC-1: fails with PEM in .env
+cp .env .env.backup
+cp fixture-env-bad-pem .env
+assert_fail "DC-1 fails with PEM in .env" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+cp .env.backup .env
+
+# DC-2: fails with missing env var
+cp docker-compose.yml docker-compose.yml.backup
+cp fixture-bad-env.yml docker-compose.yml
+assert_fail "DC-2 fails with missing env var" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+cp docker-compose.yml.backup docker-compose.yml
+
+# DC-3: fails on healthcheck anti-patterns
+cp fixture-bad-healthcheck.yml docker-compose.yml
+assert_fail "DC-3 fails on healthcheck anti-patterns" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+cp docker-compose.yml.backup docker-compose.yml
+
+# DC-5: fails on cap_drop ALL middleware
+cp fixture-bad-cap.yml docker-compose.yml
+assert_not_blocked "DC-5 cap_drop warns but does not block" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+cp docker-compose.yml.backup docker-compose.yml
+
+# DC-6: fails on circular depends_on
+cp fixture-bad-circular.yml docker-compose.yml
+assert_not_blocked "DC-6 circular depends warns but does not block" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+cp docker-compose.yml.backup docker-compose.yml
+
+# DC-7: fails on resource limit
+cp fixture-bad-resources.yml docker-compose.yml
+assert_not_blocked "DC-7 resource limit warns but does not block" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+cp docker-compose.yml.backup docker-compose.yml
+
+# DC checks skip when no compose files
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: no-compose-test
+namespace: default
+layer1:
+  dc_env_multiline: true
+  dc_env_completeness: true
+  dc_healthcheck_antipatterns: true
+  dc_tmpfs_shadow: true
+  dc_cap_drop_all: true
+  dc_depends_on_deadlock: true
+  dc_resource_limits: true
+YML
+assert_pass "DC checks skip when no compose files" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+
+# DC checks skip when disabled
+cd "$FIXTURES_DIR/compose-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: disabled-test
+namespace: default
+layer1:
+  dc_env_multiline: false
+  dc_env_completeness: false
+  dc_healthcheck_antipatterns: false
+  dc_tmpfs_shadow: false
+  dc_cap_drop_all: false
+  dc_depends_on_deadlock: false
+  dc_resource_limits: false
+YML
+assert_pass "DC checks skip when disabled" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Cleanup
+rm -f .gatekeeper.yaml .env.backup docker-compose.yml.backup
+
 # --- Summary ---
 echo ""
 echo "============================================"

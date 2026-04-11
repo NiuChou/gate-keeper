@@ -82,6 +82,24 @@ gk_suggest() {
     ((suggestions++)) || true
   fi
 
+  # Detect Docker Compose files
+  local compose_count=$(find . -maxdepth 2 \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+    -o -name 'compose*.yml' -o -name 'compose*.yaml' \) \
+    -not -path '*/.git/*' -not -path '*/node_modules/*' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$compose_count" -gt 0 ]; then
+    echo "  Detected: $compose_count Docker Compose file(s)"
+    _gk_suggest_check "dc_env_multiline" "Detect PEM/cert multi-line values in .env" "critical"
+    _gk_suggest_check "dc_env_completeness" "Verify compose \${VAR} refs exist in .env" "critical"
+    _gk_suggest_check "dc_healthcheck_antipatterns" "Detect healthcheck anti-patterns" "high"
+    _gk_suggest_check "dc_tmpfs_shadow" "Detect tmpfs vs Dockerfile mkdir conflicts" "high"
+    _gk_suggest_check "dc_cap_drop_all" "Detect cap_drop ALL on middleware images" "warning"
+    _gk_suggest_check "dc_depends_on_deadlock" "Detect circular depends_on chains" "warning"
+    _gk_suggest_check "dc_resource_limits" "Check worker count vs memory limit sanity" "warning"
+    _gk_suggest_custom "dsn_protocol_consistency" "postgresql\\+asyncpg://" ". .env" "warning" "Detect asyncpg DSN in shared env"
+    _gk_suggest_custom "pem_file_permissions" "" "." "warning" "Verify PEM/key file permissions"
+    ((suggestions+=9)) || true
+  fi
+
   echo ""
   if [ $suggestions -eq 0 ]; then
     echo "  No specific suggestions for this project structure."
