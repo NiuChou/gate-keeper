@@ -177,3 +177,136 @@ gk_audit_heatmap() {
     printf "[%-2s] %-35s %-10s  %dms\n" "$id" "$name" "$bar" "$dur"
   done < <(echo "$raw" | awk -F'|' '{print $3"|"$0}' | sort -t'|' -k1 -rn | cut -d'|' -f2-)
 }
+
+# Analyze CI/deployment health from audit history (last 20 runs)
+gk_audit_health() {
+  if [ ! -d "$GK_AUDIT_DIR" ]; then
+    echo "No audit logs found at $GK_AUDIT_DIR"
+    return 0
+  fi
+
+  local files=()
+  while read -r f; do
+    [ -n "$f" ] && files+=("$f")
+  done < <(ls -t "$GK_AUDIT_DIR"/*.json 2>/dev/null | head -20)
+
+  local n=${#files[@]}
+  if [ "$n" -eq 0 ]; then
+    echo "No audit logs found."
+    return 0
+  fi
+
+  # --- Current streak: consecutive same verdict from most recent run ---
+  local streak_verdict streak_count i
+  streak_verdict=$(grep '"verdict"' "${files[0]}" | sed 's/.*"verdict": *"//' | sed 's/".*//')
+  streak_count=1
+  for (( i=1; i<n; i++ )); do
+    local v
+    v=$(grep '"verdict"' "${files[$i]}" | sed 's/.*"verdict": *"//' | sed 's/".*//')
+    if [ "$v" = "$streak_verdict" ]; then
+      streak_count=$(( streak_count + 1 ))
+    else
+      break
+    fi
+  done
+
+  # --- Pass rate: PASSED or WARNED vs BLOCKED ---
+  local pass_count=0
+  for (( i=0; i<n; i++ )); do
+    local v
+    v=$(grep '"verdict"' "${files[$i]}" | sed 's/.*"verdict": *"//' | sed 's/".*//')
+    if [ "$v" = "PASSED" ] || [ "$v" = "WARNED" ]; then
+      pass_count=$(( pass_count + 1 ))
+    fi
+  done
+  local pass_rate=$(( pass_count * 100 / n ))
+
+  # --- Regression count: PASSED->BLOCKED transitions (newest first, so look forward) ---
+  local regressions=0
+  for (( i=0; i<n-1; i++ )); do
+    local cur next
+    cur=$(grep '"verdict"' "${files[$i]}" | sed 's/.*"verdict": *"//' | sed 's/".*//')
+    next=$(grep '"verdict"' "${files[$((i+1))]}" | sed 's/.*"verdict": *"//' | sed 's/".*//')
+    # files are newest-first: transition from older PASSED (files[i+1]) to newer BLOCKED (files[i])
+    if [ "$cur" = "BLOCKED" ] && ( [ "$next" = "PASSED" ] || [ "$next" = "WARNED" ] ); then
+      regressions=$(( regressions + 1 ))
+    fi
+  done
+
+  # --- Most failing checks: aggregate check IDs with status FAIL or HIGH across all runs ---
+  local check_counts
+  check_counts=$(
+    for (( i=0; i<n; i++ )); do
+      # Split checks array on },{ then parse each object for id and status
+      sed 's/},{/}\n{/g' "${files[$i]}" | awk '
+        /\{/ {
+          id=""; status=""
+          match($0, /"id":"[^"]*"/)
+          if (RSTART) {
+            val=substr($0, RSTART+6, RLENGTH-7)
+            gsub(/[[:space:]]/, "", val)
+            id=val
+          }
+          match($0, /"status":"[^"]*"/)
+          if (RSTART) {
+            val=substr($0, RSTART+10, RLENGTH-11)
+            gsub(/[[:space:]]/, "", val)
+            status=val
+          }
+          match($0, /"name":"[^"]*"/)
+          if (RSTART) {
+            val=substr($0, RSTART+8, RLENGTH-9)
+            gsub(/[[:space:]]*$/, "", val)
+            name=val
+          }
+          if (id != "" && (status == "FAIL" || status == "HIGH")) {
+            print id "|" name
+          }
+        }
+      '
+    done | sort | awk -F'|' '
+      {
+        key=$1; name=$2
+        count[key]++
+        names[key]=name
+      }
+      END {
+        for (k in count) print count[k] "|" k "|" names[k]
+      }
+    ' | sort -t'|' -k1 -rn | head -5
+  )
+
+  # --- Output ---
+  echo "CI Health Report (last $n runs):"
+  echo ""
+
+  if [ "$streak_verdict" = "BLOCKED" ]; then
+    printf "  Current streak:  %d consecutive BLOCKED ❌\n" "$streak_count"
+  else
+    printf "  Current streak:  %d consecutive PASSED ✅\n" "$streak_count"
+  fi
+  printf "  Pass rate:       %d%% (%d/%d)\n" "$pass_rate" "$pass_count" "$n"
+  printf "  Regressions:     %d (PASS→BLOCK transitions)\n" "$regressions"
+
+  if [ -n "$check_counts" ]; then
+    echo ""
+    echo "  Most failing checks:"
+    while IFS='|' read -r cnt cid cname; do
+      cid=$(echo "$cid" | sed 's/[[:space:]]*$//')
+      cname=$(echo "$cname" | sed 's/[[:space:]]*$//')
+      printf "    [%-4s] %-35s — failed %d/%d runs\n" "$cid" "$cname" "$cnt" "$n"
+    done <<< "$check_counts"
+  fi
+
+  echo ""
+
+  # Warnings
+  if [ "$streak_verdict" = "BLOCKED" ] && [ "$streak_count" -ge 3 ]; then
+    echo "  ⚠ WARNING: 3+ consecutive failures. Tech debt is accumulating."
+    echo "  Consider fixing CI before merging new features."
+  fi
+
+  if [ "$pass_rate" -lt 50 ]; then
+    echo "  ⚠ CRITICAL: Pass rate below 50%. Deployment quality is degraded."
+  fi
+}

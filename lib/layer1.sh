@@ -22,6 +22,17 @@ gk_layer1_run() {
       "DC-5|cap_drop ALL on middleware|dc_cap_drop_all|gk_check_dc_cap_drop_all"
       "DC-6|depends_on deadlock detection|dc_depends_on_deadlock|gk_check_dc_depends_on_deadlock"
       "DC-7|Resource limit sanity|dc_resource_limits|gk_check_dc_resource_limits"
+      "J|Next.js rewrite completeness|nextjs_rewrite_completeness|gk_check_nextjs_rewrite_completeness"
+      "FA-1|FastAPI global exception handler|fastapi_exception_handler|gk_check_fastapi_exception_handler"
+      "FA-2|FastAPI endpoint try/except|fastapi_endpoint_try_except|gk_check_fastapi_endpoint_try_except"
+      "FA-3|API path string literal ban|api_path_literal_ban|gk_check_api_path_literal_ban"
+      "FA-4|Rate limit Retry-After header|ratelimit_retry_after|gk_check_ratelimit_retry_after"
+      # LUMI-inspired checks (v2.3.0)
+      "ENV-1|Env placeholder detection|env_placeholders|gk_check_env_placeholders"
+      "SEC-1|Secret file reference integrity|secret_file_refs|gk_check_secret_file_refs"
+      "DEP-1|Dependency lock compatibility|dep_lock_compat|gk_check_dep_lock_compat"
+      "PY-1|Python duplicate module names|python_duplicate_modules|gk_check_python_duplicate_modules"
+      "TEST-1|Test isolation indicators|test_isolation|gk_check_test_isolation"
     )
     for def in "${check_defs[@]}"; do
       local id="${def%%|*}"; local rest="${def#*|}"
@@ -60,6 +71,19 @@ gk_layer1_run() {
   gk_maybe_run "DC-5" "cap_drop ALL on middleware" "dc_cap_drop_all" gk_check_dc_cap_drop_all
   gk_maybe_run "DC-6" "depends_on deadlock detection" "dc_depends_on_deadlock" gk_check_dc_depends_on_deadlock
   gk_maybe_run "DC-7" "Resource limit sanity" "dc_resource_limits" gk_check_dc_resource_limits
+  # Next.js rewrite completeness
+  gk_maybe_run "J" "Next.js rewrite completeness" "nextjs_rewrite_completeness" gk_check_nextjs_rewrite_completeness
+  # FastAPI / API resilience checks
+  gk_maybe_run "FA-1" "FastAPI global exception handler" "fastapi_exception_handler" gk_check_fastapi_exception_handler
+  gk_maybe_run "FA-2" "FastAPI endpoint try/except" "fastapi_endpoint_try_except" gk_check_fastapi_endpoint_try_except
+  gk_maybe_run "FA-3" "API path string literal ban" "api_path_literal_ban" gk_check_api_path_literal_ban
+  gk_maybe_run "FA-4" "Rate limit Retry-After header" "ratelimit_retry_after" gk_check_ratelimit_retry_after
+  # LUMI-inspired checks (v2.3.0)
+  gk_maybe_run "ENV-1" "Env placeholder detection" "env_placeholders" gk_check_env_placeholders
+  gk_maybe_run "SEC-1" "Secret file reference integrity" "secret_file_refs" gk_check_secret_file_refs
+  gk_maybe_run "DEP-1" "Dependency lock compatibility" "dep_lock_compat" gk_check_dep_lock_compat
+  gk_maybe_run "PY-1" "Python duplicate module names" "python_duplicate_modules" gk_check_python_duplicate_modules
+  gk_maybe_run "TEST-1" "Test isolation indicators" "test_isolation" gk_check_test_isolation
   gk_run_custom_checks
 }
 
@@ -512,6 +536,313 @@ gk_check_dc_resource_limits() {
       ((errors++)) || true
     fi
   done <<< "$compose_files"
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+# ── Next.js Rewrite Completeness (J) ────────────────────────────────────────
+
+# J: Verify that every API path prefix used in frontend code is covered by
+#    a Next.js rewrite rule. Prevents front/back route mismatch (root cause 2).
+gk_check_nextjs_rewrite_completeness() {
+  # Find next.config file (supports .js, .ts, .mjs, .cjs)
+  local config_file=""
+  for f in next.config.js next.config.ts next.config.mjs next.config.cjs; do
+    [ -f "$f" ] && config_file="$f" && break
+  done
+  [ -z "$config_file" ] && return 0
+
+  # Extract rewrite source paths from next.config
+  # Handles flat array and structured groups (beforeFiles/afterFiles/fallback)
+  local rewrite_sources
+  rewrite_sources=$(grep -oE "source:[[:space:]]*['\"][^'\"]+['\"]" "$config_file" 2>/dev/null \
+    | sed "s/source:[[:space:]]*['\"]//; s/['\"]$//" \
+    | sed 's|/:path\*||; s|/\*||; s|/:.*||' \
+    | sort -u || true)
+
+  # Build search dirs and grep excludes (shared by both branches)
+  local search_dirs=""
+  for d in src app pages components lib; do
+    [ -d "$d" ] && search_dirs="$search_dirs $d"
+  done
+  [ -z "$search_dirs" ] && return 0
+
+  local -a grep_args=()
+  _gk_build_grep_excludes "node_modules,.next,dist,build,__tests__,__mocks__"
+
+  local _includes="--include=*.ts --include=*.tsx --include=*.js --include=*.jsx"
+  local _test_filter='\.test\.\|\.spec\.\|__tests__\|__mocks__'
+
+  # If no rewrites defined, check if frontend uses API paths at all
+  if [ -z "$rewrite_sources" ]; then
+    local api_prefix
+    api_prefix=$(gk_config_value "nextjs_rewrite_completeness.api_prefix" "/svc/")
+
+    local api_calls
+    api_calls=$(grep -rn "${grep_args[@]}" $_includes \
+      -E "(fetch|axios|useSWR|ky|\.request|\.get|\.post|\.put|\.delete)\(['\"\`]${api_prefix}" \
+      $search_dirs 2>/dev/null | grep -v "$_test_filter" | head -5 || true)
+
+    if [ -n "$api_calls" ]; then
+      echo "Frontend uses '${api_prefix}' API paths but next.config has no rewrite rules:"
+      echo "$api_calls"
+      echo "  Fix: Add rewrites() in $config_file to proxy ${api_prefix}* to the backend"
+      return 1
+    fi
+    return 0
+  fi
+
+  # Rewrites exist — extract multi-segment API path prefixes from frontend code
+  # Extracts up to 2 path segments: /api/auth from fetch("/api/auth/login")
+  local api_prefixes
+  api_prefixes=$(grep -rohE "${grep_args[@]}" $_includes \
+    -E "(fetch|axios|useSWR|ky|\.request|\.get|\.post|\.put|\.delete)\(['\"\`]\/[a-zA-Z][a-zA-Z0-9_-]*(\/[a-zA-Z][a-zA-Z0-9_-]*)?" \
+    $search_dirs 2>/dev/null \
+    | grep -v "$_test_filter" \
+    | grep -oE "\/[a-zA-Z][a-zA-Z0-9_-]*(\/[a-zA-Z][a-zA-Z0-9_-]*)?" \
+    | sort -u || true)
+  [ -z "$api_prefixes" ] && return 0
+
+  local errors=0
+  while IFS= read -r call_path; do
+    [ -z "$call_path" ] && continue
+    # Check if any rewrite source covers this call path
+    # Match rules:
+    #   - exact match: /svc == /svc
+    #   - call is under rewrite: /svc/users starts with /svc
+    #   - rewrite is under call: /api/auth covered by call to /api/auth
+    local covered=false
+    while IFS= read -r rewrite; do
+      [ -z "$rewrite" ] && continue
+      if [ "$call_path" = "$rewrite" ] || [[ "$call_path" == "$rewrite"* ]] || [[ "$rewrite" == "$call_path"* ]]; then
+        covered=true
+        break
+      fi
+    done <<< "$rewrite_sources"
+
+    if [ "$covered" = false ]; then
+      echo "Frontend uses '${call_path}/' but no matching rewrite in $config_file"
+      ((errors++)) || true
+    fi
+  done <<< "$api_prefixes"
+
+  if [ $errors -gt 0 ]; then
+    echo "  Fix: Add rewrite rules for uncovered prefixes in $config_file rewrites()"
+  fi
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+# ── FastAPI / API Resilience Checks (FA-1 .. FA-4) ──────────────────────────
+
+gk_find_python_dirs() {
+  local config_key="${1:-fastapi_exception_handler}"
+  local custom
+  custom=$(gk_config_value "${config_key}.paths" "")
+  if [ -n "$custom" ]; then
+    echo "$custom"
+    return
+  fi
+  for d in apps services src app api backend; do
+    [ -d "$d" ] && echo "$d"
+  done
+}
+
+# FA-1: All FastAPI services must register a global Exception handler
+# Looks for FastAPI() instantiation and verifies app.add_exception_handler or
+# @app.exception_handler decorator exists in the same file or entry point.
+gk_check_fastapi_exception_handler() {
+  local search_dirs
+  search_dirs=$(gk_find_python_dirs)
+  [ -z "$search_dirs" ] && return 0
+
+  local -a grep_args=()
+  _gk_build_grep_excludes ""
+
+  # Find all Python files that create a FastAPI() app
+  local fastapi_files
+  fastapi_files=$(grep -rl "${grep_args[@]}" --include='*.py' 'FastAPI()' $search_dirs 2>/dev/null || true)
+  [ -z "$fastapi_files" ] && return 0
+
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    local dir
+    dir=$(dirname "$f")
+    local has_exception=false
+    local has_http_exception=false
+
+    # Scan this file and sibling convention files for handler registrations
+    for candidate in "$f" "$dir/main.py" "$dir/app.py" "$dir/__init__.py" "$dir/exceptions.py" "$dir/exception_handlers.py" "$dir/error_handlers.py"; do
+      [ -f "$candidate" ] || continue
+      # Check for generic Exception handler (the critical one — catches unhandled errors)
+      if grep -qE '(add_exception_handler|@.*exception_handler)\s*\(\s*Exception\b' "$candidate" 2>/dev/null; then
+        has_exception=true
+      fi
+      # Check for HTTPException handler
+      if grep -qE '(add_exception_handler|@.*exception_handler)\s*\(\s*(HTTPException|StarletteHTTPException|RequestValidationError)\b' "$candidate" 2>/dev/null; then
+        has_http_exception=true
+      fi
+      $has_exception && $has_http_exception && break
+    done
+
+    local missing=""
+    if ! $has_exception && ! $has_http_exception; then
+      missing="Exception + HTTPException"
+    elif ! $has_exception; then
+      missing="Exception"
+    elif ! $has_http_exception; then
+      missing="HTTPException"
+    fi
+
+    if [ -n "$missing" ]; then
+      echo "$f: FastAPI() created but missing global handler for: $missing"
+      echo "  Fix: Register both app.add_exception_handler(Exception, ...) and app.add_exception_handler(HTTPException, ...)"
+      ((errors++)) || true
+    fi
+  done <<< "$fastapi_files"
+
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+# FA-2: POST/PUT/DELETE endpoint functions must contain try/except
+# Scans for @app.post, @router.post etc. and verifies the function body has try/except.
+gk_check_fastapi_endpoint_try_except() {
+  local search_dirs
+  search_dirs=$(gk_find_python_dirs "fastapi_endpoint_try_except")
+  [ -z "$search_dirs" ] && return 0
+
+  local -a grep_args=()
+  _gk_build_grep_excludes ""
+
+  # Find files with mutation endpoints
+  local endpoint_files
+  endpoint_files=$(grep -rl "${grep_args[@]}" --include='*.py' -E '@(app|router)\.(post|put|delete|patch)\(' $search_dirs 2>/dev/null || true)
+  [ -z "$endpoint_files" ] && return 0
+
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    # Use awk to find mutation endpoint functions without try/except
+    local missing
+    missing=$(awk '
+      /^[[:space:]]*@(app|router)\.(post|put|delete|patch)\(/ {
+        in_decorator=1; next
+      }
+      in_decorator && /^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+/ {
+        func_name=$0
+        sub(/^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+/, "", func_name)
+        sub(/\(.*/, "", func_name)
+        in_func=1; has_try=0; in_decorator=0
+        func_indent=0
+        match($0, /^[[:space:]]*/)
+        func_indent=RLENGTH
+        next
+      }
+      in_decorator && /^[[:space:]]*@/ { next }
+      in_decorator && /^[^@[:space:]]/ { in_decorator=0 }
+      in_func {
+        # Detect function end: non-empty line at same or less indent (not blank)
+        if (/^[^ \t]/ || (/^[[:space:]]/ && !/^[[:space:]]*$/ && !/^[[:space:]]*#/)) {
+          match($0, /^[[:space:]]*/);
+          if (RLENGTH <= func_indent && !/^[[:space:]]*$/) {
+            if (!has_try) print FILENAME ": " func_name "() missing try/except"
+            in_func=0
+          }
+        }
+        if (/try:/) has_try=1
+      }
+      END {
+        if (in_func && !has_try) print FILENAME ": " func_name "() missing try/except"
+      }
+    ' "$f" 2>/dev/null || true)
+
+    if [ -n "$missing" ]; then
+      echo "$missing"
+      ((errors++)) || true
+    fi
+  done <<< "$endpoint_files"
+
+  if [ $errors -gt 0 ]; then
+    echo "  Fix: Wrap POST/PUT/DELETE/PATCH endpoint bodies in try/except with proper error handling"
+  fi
+  [ $errors -eq 0 ] || return 1
+  return 0
+}
+
+# FA-3: Ban hardcoded API path string literals in frontend code
+# Prevents front/back route mismatch by requiring path constants.
+gk_check_api_path_literal_ban() {
+  local search_dirs
+  search_dirs=$(gk_config_value "api_path_literal_ban.paths" "")
+  [ -z "$search_dirs" ] && {
+    for d in src app pages components lib; do
+      [ -d "$d" ] && search_dirs="$search_dirs $d"
+    done
+  }
+  [ -z "$search_dirs" ] && return 0
+
+  local api_prefix
+  api_prefix=$(gk_config_value "api_path_literal_ban.api_prefix" "/api/")
+
+  local -a grep_args=()
+  _gk_build_grep_excludes "node_modules,.next,dist,build,__tests__,test"
+
+  # Look for fetch/axios calls with hardcoded API paths
+  # Match patterns like: fetch("/api/...", axios.get("/api/..., etc.
+  local found
+  found=$(grep -rn "${grep_args[@]}" --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' \
+    -E "(fetch|axios\.(get|post|put|delete|patch)|\.request)\(['\"]${api_prefix}" \
+    $search_dirs 2>/dev/null | grep -v '\.test\.' | grep -v '\.spec\.' | grep -v '__test__' | grep -v 'API_PATHS\|API_ROUTES\|apiPaths\|apiRoutes\|ENDPOINTS' || true)
+
+  if [ -n "$found" ]; then
+    echo "Hardcoded API path literals found (use constants like API_PATHS.*):"
+    echo "$found" | head -10
+    echo "  Fix: Define API paths as constants (e.g. API_PATHS.ME) and import them"
+    return 1
+  fi
+  return 0
+}
+
+# FA-4: Rate limiter middleware must include Retry-After header in 429 responses
+# Drift check: if rate limiting exists, Retry-After must also exist.
+gk_check_ratelimit_retry_after() {
+  local search_dirs
+  search_dirs=$(gk_config_value "ratelimit_retry_after.paths" "")
+  [ -z "$search_dirs" ] && {
+    for d in apps services src app api gateway middleware backend; do
+      [ -d "$d" ] && search_dirs="$search_dirs $d"
+    done
+  }
+  [ -z "$search_dirs" ] && return 0
+
+  local -a grep_args=()
+  _gk_build_grep_excludes ""
+
+  # Check for rate limiting code
+  local ratelimit_files
+  ratelimit_files=$(grep -rl "${grep_args[@]}" --include='*.py' --include='*.go' --include='*.ts' --include='*.js' \
+    -E '(rate.?limit|RateLimit|HTTP.?429|status.*429|TooManyRequests)' \
+    $search_dirs 2>/dev/null || true)
+  [ -z "$ratelimit_files" ] && return 0
+
+  # Among files that implement rate limiting, check for Retry-After header
+  local errors=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    # Only check files that actually set 429 status or raise rate limit errors
+    if grep -qE '(status.?(code)?.*429|HTTPStatus\.TOO_MANY|HTTP_429|TooManyRequests|RateLimitExceeded)' "$f" 2>/dev/null; then
+      if ! grep -i 'Retry-After' "$f" 2>/dev/null | grep -qv '^\s*#\|^\s*"""\|^\s*//\|^\s*\*'; then
+        echo "$f: returns 429 but does not set Retry-After header"
+        ((errors++)) || true
+      fi
+    fi
+  done <<< "$ratelimit_files"
+
+  if [ $errors -gt 0 ]; then
+    echo "  Fix: Add 'Retry-After' header to all 429 responses (RFC 6585)"
+  fi
   [ $errors -eq 0 ] || return 1
   return 0
 }

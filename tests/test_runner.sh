@@ -90,7 +90,7 @@ echo ""
 echo "── CLI Basics ──"
 assert_pass "version command" "$PROJECT_DIR/bin/gate-keeper" version
 assert_pass "help command" "$PROJECT_DIR/bin/gate-keeper" help
-assert_contains "version output" "v2.0.0" "$PROJECT_DIR/bin/gate-keeper" version
+assert_contains "version output" "v2.4.0" "$PROJECT_DIR/bin/gate-keeper" version
 
 # --- Test: Init ---
 echo ""
@@ -1173,6 +1173,300 @@ assert_pass "DC checks skip when disabled" "$PROJECT_DIR/bin/gate-keeper" run --
 
 # Cleanup
 rm -f .gatekeeper.yaml .env.backup docker-compose.yml.backup
+
+# --- Test: Next.js Rewrite Completeness (J) ---
+echo ""
+echo "── Next.js Rewrite Completeness (J) ──"
+
+cd "$FIXTURES_DIR/nextjs-project"
+
+# J: detect uncovered rewrite prefix
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: nextjs-test
+namespace: default
+layer1:
+  nextjs_rewrite_completeness:
+    enabled: true
+    severity: critical
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+# /admin/ and /metrics/ are used in api-bad.ts but no rewrite covers them
+assert_fail "J: detect uncovered rewrite prefix" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+assert_contains "J: reports missing prefix" "no matching rewrite" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# J: passes when only covered prefixes are used
+rm -f src/lib/api-bad.ts
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: nextjs-test
+namespace: default
+layer1:
+  nextjs_rewrite_completeness:
+    enabled: true
+    severity: critical
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_pass "J: passes when all prefixes covered" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Restore bad fixture
+cat > src/lib/api-bad.ts << 'TS'
+import axios from "axios";
+export const getAdminUsers = () => axios.get("/admin/users");
+export const getMetrics = () => fetch("/metrics/dashboard");
+TS
+
+# J: disabled → should pass
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: nextjs-test
+namespace: default
+layer1:
+  nextjs_rewrite_completeness: false
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_pass "J: skip when disabled" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# J: passes on project without next.config
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: no-nextjs-test
+namespace: default
+layer1:
+  nextjs_rewrite_completeness: true
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_pass "J: passes when no next.config exists" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+
+# J: no-rewrites but API calls exist → should fail
+cd "$FIXTURES_DIR/nextjs-project"
+cp next.config.js next.config.js.bak
+cat > next.config.js << 'CONF'
+module.exports = {};
+CONF
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: nextjs-test
+namespace: default
+layer1:
+  nextjs_rewrite_completeness:
+    enabled: true
+    severity: critical
+    api_prefix: "/svc/"
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_fail "J: fails when no rewrites but API calls exist" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+mv next.config.js.bak next.config.js
+rm -f .gatekeeper.yaml
+
+# --- Test: FastAPI / API Resilience Checks (FA-1..FA-4) ---
+echo ""
+echo "── FastAPI / API Resilience Checks ──"
+
+# FA-1: Global exception handler
+cd "$FIXTURES_DIR/fastapi-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: fastapi-test
+namespace: default
+layer1:
+  fastapi_exception_handler:
+    enabled: true
+    severity: critical
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+
+# The user_service/main.py has FastAPI() but no exception handler → should FAIL
+assert_fail "FA-1: detect missing global exception handler" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+assert_contains "FA-1: reports file name" "user_service" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# FA-1 regression: only HTTPException handler (no Exception handler) must also FAIL
+# This is the exact pattern that caused the 500 error — generic exceptions fall through.
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: fastapi-test
+namespace: default
+layer1:
+  fastapi_exception_handler:
+    enabled: true
+    severity: critical
+    paths: "apps/partial_handler"
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_fail "FA-1: detect HTTPException-only handler (missing Exception)" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+assert_contains "FA-1: reports missing Exception" "Exception" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# FA-2: Endpoint try/except
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: fastapi-test
+namespace: default
+layer1:
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except:
+    enabled: true
+    severity: high
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+# user_service has POST/DELETE without try/except → should detect (exit 2 for HIGH)
+assert_contains "FA-2: detect endpoint without try/except" "missing try/except" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# FA-3: API path literal ban
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: fastapi-test
+namespace: default
+layer1:
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban:
+    enabled: true
+    severity: warning
+    api_prefix: "/api/"
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_contains "FA-3: detect hardcoded API path literals" "Hardcoded API path" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# FA-4: Retry-After header
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: fastapi-test
+namespace: default
+layer1:
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after:
+    enabled: true
+    severity: critical
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+# user_service/ratelimit.py returns 429 without Retry-After → should FAIL
+assert_fail "FA-4: detect 429 without Retry-After" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+assert_contains "FA-4: reports Retry-After" "Retry-After" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Test: all FA checks disabled → should pass
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: fastapi-test
+namespace: default
+layer1:
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_pass "FA checks skip when disabled" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Test: FA checks on good project (gateway has handler + retry-after) → should pass
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: fastapi-test
+namespace: default
+layer1:
+  fastapi_exception_handler:
+    enabled: true
+    severity: critical
+    paths: "apps/gateway"
+  fastapi_endpoint_try_except:
+    enabled: true
+    severity: high
+    paths: "apps/gateway"
+  api_path_literal_ban: false
+  ratelimit_retry_after:
+    enabled: true
+    severity: critical
+    paths: "apps/gateway"
+  env_placeholders: false
+  secret_file_refs: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_pass "FA checks pass on well-structured service" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+
+# Test: FA checks pass on project with no Python files (edge case)
+cd "$FIXTURES_DIR/good-project"
+cat > .gatekeeper.yaml << 'YML'
+version: 1
+project: no-python-test
+namespace: default
+layer1:
+  fastapi_exception_handler: true
+  fastapi_endpoint_try_except: true
+  api_path_literal_ban: true
+  ratelimit_retry_after: true
+  env_placeholders: false
+  secret_file_refs: false
+  dep_lock_compat: false
+  python_duplicate_modules: false
+  test_isolation: false
+YML
+assert_pass "FA checks pass when no Python/frontend files exist" "$PROJECT_DIR/bin/gate-keeper" run --layer=1
+rm -f .gatekeeper.yaml
+
+cd "$FIXTURES_DIR/fastapi-project"
+rm -f .gatekeeper.yaml
 
 # --- Summary ---
 echo ""

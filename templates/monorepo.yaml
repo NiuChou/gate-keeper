@@ -20,6 +20,18 @@ layer1:
   dc_cap_drop_all: false
   dc_depends_on_deadlock: false
   dc_resource_limits: false
+  nextjs_rewrite_completeness: false
+  # FastAPI / API resilience checks
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  # LUMI-inspired checks
+  env_placeholders: true
+  secret_file_refs: true
+  dep_lock_compat: true
+  python_duplicate_modules: true
+  test_isolation: true
 layer2:
   secret_name: "my-secret"
   deployment_name_match: true

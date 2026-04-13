@@ -19,6 +19,24 @@ layer1:
   dc_cap_drop_all: false
   dc_depends_on_deadlock: false
   dc_resource_limits: false
+  # Next.js rewrite completeness
+  nextjs_rewrite_completeness:
+    enabled: true
+    severity: critical
+  # FastAPI / API resilience checks
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban:
+    enabled: true
+    severity: warning
+    api_prefix: "/api/"
+  ratelimit_retry_after: false
+  # LUMI-inspired checks
+  env_placeholders: true
+  secret_file_refs: false
+  dep_lock_compat: true
+  python_duplicate_modules: false
+  test_isolation: false
 layer2:
   deployment_name_match: false
   image_name_match: false

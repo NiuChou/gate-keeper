@@ -3,7 +3,7 @@
 # https://github.com/NiuChou/gate-keeper
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
 TEMPLATE_DIR="${TEMPLATE_DIR:-${SCRIPT_DIR}/../templates}"
@@ -20,12 +20,52 @@ source "${LIB_DIR}/supervision.sh"
 [ -f "${LIB_DIR}/plugins.sh" ]    && source "${LIB_DIR}/plugins.sh"
 [ -f "${LIB_DIR}/audit_ext.sh" ]  && source "${LIB_DIR}/audit_ext.sh"
 [ -f "${LIB_DIR}/suggest.sh" ]    && source "${LIB_DIR}/suggest.sh"
+# LUMI-inspired extensions (v2.3.0)
+[ -f "${LIB_DIR}/checks_env.sh" ]     && source "${LIB_DIR}/checks_env.sh"
+[ -f "${LIB_DIR}/checks_quality.sh" ] && source "${LIB_DIR}/checks_quality.sh"
+[ -f "${LIB_DIR}/precommit.sh" ]      && source "${LIB_DIR}/precommit.sh"
 
 COMMAND="${1:-run}"
 shift 2>/dev/null || true
 
 case "$COMMAND" in
-  init)    gk_init "$@" ;;
+  init)
+    # Handle --pre-commit flag
+    for arg in "$@"; do
+      case "$arg" in
+        --pre-commit)
+          if type gk_generate_precommit >/dev/null 2>&1; then
+            for a2 in "$@"; do [ "$a2" = "--force" ] && GK_FORCE=true; done
+            gk_generate_precommit
+          else
+            echo "Pre-commit generation not available"
+          fi
+          exit 0
+          ;;
+        --hooks)
+          if type gk_generate_githooks >/dev/null 2>&1; then
+            for a2 in "$@"; do [ "$a2" = "--force" ] && GK_FORCE=true; done
+            # Pass --setup if --setup-hooks is also present
+            local hook_args=""
+            for a2 in "$@"; do [ "$a2" = "--setup-hooks" ] && hook_args="--setup"; done
+            gk_generate_githooks $hook_args
+          else
+            echo "Git hook generation not available"
+          fi
+          exit 0
+          ;;
+        --setup-hooks)
+          if type gk_setup_hooks_path >/dev/null 2>&1; then
+            gk_setup_hooks_path
+          else
+            echo "Hook setup not available"
+          fi
+          exit 0
+          ;;
+      esac
+    done
+    gk_init "$@"
+    ;;
   run)     gk_run "$@" ;;
   add)     gk_add "$@" ;;
   audit)
@@ -42,6 +82,10 @@ case "$COMMAND" in
           ;;
         --heatmap)
           gk_audit_heatmap 2>/dev/null || echo "Heatmap not available"
+          exit 0
+          ;;
+        --health)
+          gk_audit_health 2>/dev/null || echo "Health report not available"
           exit 0
           ;;
       esac
@@ -72,6 +116,10 @@ case "$COMMAND" in
     echo ""
     echo "Commands:"
     echo "  init      Detect project type, generate .gatekeeper.yaml"
+    echo "            --pre-commit    Generate .pre-commit-config.yaml (framework)"
+    echo "            --hooks         Generate .githooks/pre-commit (raw shell, zero deps)"
+    echo "            --hooks --setup-hooks  Generate + activate via core.hooksPath"
+    echo "            --setup-hooks   Activate .githooks/ via git config core.hooksPath"
     echo "  run       Execute checks (default)"
     echo "  add       Add a custom check to .gatekeeper.yaml"
     echo "  audit     View audit log history"
@@ -98,6 +146,7 @@ case "$COMMAND" in
     echo "  --trend              Show pass rate trend (ASCII chart)"
     echo "  --export=csv         Export audit history as CSV"
     echo "  --heatmap            Show check duration heatmap"
+    echo "  --health             CI health report (streak, pass rate, regressions)"
     echo ""
     echo "Options for 'add':"
     echo "  --id=ID              Check ID (required)"

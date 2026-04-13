@@ -34,6 +34,18 @@ layer1:
     enabled: true
     severity: warning
     per_worker_mb: 128
+  nextjs_rewrite_completeness: false
+  # FastAPI / API resilience checks
+  fastapi_exception_handler: false
+  fastapi_endpoint_try_except: false
+  api_path_literal_ban: false
+  ratelimit_retry_after: false
+  # LUMI-inspired checks
+  env_placeholders: true
+  secret_file_refs: true
+  dep_lock_compat: false
+  python_duplicate_modules: false
+  test_isolation: false
 layer2:
   deployment_name_match: false
   image_name_match: false

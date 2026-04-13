@@ -24,6 +24,14 @@ gk_suggest() {
     _gk_suggest_check "python_packaging" "Check pyproject.toml / setup.py consistency" "warning"
     _gk_suggest_custom "no_debug_true" "DEBUG.*=.*True" "." "critical" "Prevent DEBUG=True in production"
     _gk_suggest_custom "no_hardcoded_secrets" "password.*=.*['\"]" "." "critical" "Detect hardcoded passwords"
+    # FastAPI-specific checks
+    if grep -rql 'fastapi\|FastAPI' requirements*.txt pyproject.toml setup.py setup.cfg 2>/dev/null; then
+      echo "  Detected: FastAPI dependency"
+      _gk_suggest_check "fastapi_exception_handler" "Require global Exception handler" "critical"
+      _gk_suggest_check "fastapi_endpoint_try_except" "Require try/except in mutation endpoints" "high"
+      _gk_suggest_check "ratelimit_retry_after" "Require Retry-After on 429 responses" "critical"
+      ((suggestions+=3)) || true
+    fi
     ((suggestions+=3)) || true
   fi
 
@@ -32,7 +40,14 @@ gk_suggest() {
     echo "  Detected: Node.js project"
     _gk_suggest_custom "no_console_log" "console\\.log" "src" "warning" "Remove console.log before production"
     _gk_suggest_custom "no_debugger" "debugger;" "src" "critical" "Remove debugger statements"
-    ((suggestions+=2)) || true
+    _gk_suggest_check "api_path_literal_ban" "Ban hardcoded API path literals" "warning"
+    # Detect Next.js projects
+    if [ -f "next.config.js" ] || [ -f "next.config.ts" ] || [ -f "next.config.mjs" ] || [ -f "next.config.cjs" ]; then
+      echo "  Detected: Next.js project"
+      _gk_suggest_check "nextjs_rewrite_completeness" "Verify API paths have matching rewrites" "critical"
+      ((suggestions++)) || true
+    fi
+    ((suggestions+=3)) || true
   fi
 
   # Detect Dockerfiles
@@ -79,7 +94,8 @@ gk_suggest() {
   if find . -name '.env' -not -path '*/.git/*' 2>/dev/null | grep -q '.'; then
     echo "  Detected: .env file(s)"
     _gk_suggest_custom "no_env_committed" "^[A-Z_]+=.+" ".env" "critical" "Remove .env from version control"
-    ((suggestions++)) || true
+    _gk_suggest_check "env_placeholders" "Detect placeholder values in .env files" "critical"
+    ((suggestions+=2)) || true
   fi
 
   # Detect Docker Compose files
@@ -95,9 +111,61 @@ gk_suggest() {
     _gk_suggest_check "dc_cap_drop_all" "Detect cap_drop ALL on middleware images" "warning"
     _gk_suggest_check "dc_depends_on_deadlock" "Detect circular depends_on chains" "warning"
     _gk_suggest_check "dc_resource_limits" "Check worker count vs memory limit sanity" "warning"
+    _gk_suggest_check "secret_file_refs" "Verify secret file references" "critical"
     _gk_suggest_custom "dsn_protocol_consistency" "postgresql\\+asyncpg://" ". .env" "warning" "Detect asyncpg DSN in shared env"
     _gk_suggest_custom "pem_file_permissions" "" "." "warning" "Verify PEM/key file permissions"
-    ((suggestions+=9)) || true
+    ((suggestions+=10)) || true
+  fi
+
+  # Detect multi-app Python monorepo structure
+  if ([ -f "pyproject.toml" ] || [ -f "requirements.txt" ] || [ -f "setup.py" ]) && \
+     ([ -d "apps" ] || [ -d "services" ] || [ -d "packages" ]); then
+    echo "  Detected: Multi-app Python structure"
+    _gk_suggest_check "python_duplicate_modules" "Detect duplicate module names" "warning"
+    _gk_suggest_check "test_isolation" "Check test fixture isolation" "warning"
+    ((suggestions+=2)) || true
+  fi
+
+  # Detect dependency lock files
+  local lock_found=0
+  if [ -f "Cargo.lock" ]; then
+    echo "  Detected: Cargo.lock"
+    lock_found=1
+  fi
+  if [ -f "package-lock.json" ] || [ -f "yarn.lock" ] || [ -f "pnpm-lock.yaml" ]; then
+    echo "  Detected: Node.js lock file"
+    lock_found=1
+  fi
+  if [ "$lock_found" -eq 1 ]; then
+    _gk_suggest_check "dep_lock_compat" "Check lock file vs toolchain compatibility" "warning"
+    ((suggestions++)) || true
+  fi
+
+  # Detect pytest / conftest
+  if find . -name 'conftest.py' -not -path '*/.git/*' 2>/dev/null | grep -q '.' || \
+     find . -name 'pytest.ini' -o -name 'pyproject.toml' -not -path '*/.git/*' 2>/dev/null | xargs grep -l 'pytest' 2>/dev/null | grep -q '.'; then
+    echo "  Detected: pytest configuration"
+    _gk_suggest_check "test_isolation" "Check test fixture isolation" "warning"
+    ((suggestions++)) || true
+  fi
+
+  # Suggest pre-commit hooks if not present
+  if [ ! -f ".pre-commit-config.yaml" ] && [ ! -f ".githooks/pre-commit" ]; then
+    echo "  Detected: No pre-commit hooks configured"
+    printf "    ${BLUE}+${RESET} %-35s gate-keeper init --hooks\n" "Generate raw git hooks (zero deps)"
+    printf "    ${BLUE}+${RESET} %-35s gate-keeper init --pre-commit\n" "Generate pre-commit framework config"
+    ((suggestions+=2)) || true
+  elif [ ! -f ".githooks/pre-commit" ] && [ -f ".pre-commit-config.yaml" ]; then
+    printf "    ${GREEN}✓${RESET} %-35s (pre-commit framework)\n" "pre-commit hooks"
+  elif [ -f ".githooks/pre-commit" ]; then
+    printf "    ${GREEN}✓${RESET} %-35s (.githooks/pre-commit)\n" "raw git hooks"
+    # Check if core.hooksPath is set
+    local hooks_path
+    hooks_path=$(git config core.hooksPath 2>/dev/null || true)
+    if [ "$hooks_path" != ".githooks" ]; then
+      printf "    ${YELLOW}○${RESET} %-35s gate-keeper init --setup-hooks\n" "hooks not activated (core.hooksPath)"
+      ((suggestions++)) || true
+    fi
   fi
 
   echo ""

@@ -179,8 +179,8 @@ gk_run_check() {
   gk_record "$id" "$name" "$status" "$output" "$duration" "$severity"
   gk_print_check "$id" "$name" "$status" "$duration"
 
-  # Print details on failure/warning (includes fix_hint if present)
-  if [ "$status" = "FAIL" ] || [ "$status" = "WARN" ]; then
+  # Print details on failure/warning/high (includes fix_hint if present)
+  if [ "$status" = "FAIL" ] || [ "$status" = "WARN" ] || [ "$status" = "HIGH" ]; then
     if [ -n "$output" ]; then
       echo "$output" | head -8 | sed 's/^/    /'
     fi
@@ -278,7 +278,7 @@ gk_dry_run_preview() {
 
   if [ "$run_l1" = true ]; then
     echo "  Layer 1: Static Checks"
-    for check in A:go_work B:shell_syntax C:python_packaging D:dockerfile_copy E:dockerfile_antipatterns F:secretref_ban G:deprecated_refs H:port_chain I:namespace_consistency DC-1:dc_env_multiline DC-2:dc_env_completeness DC-3:dc_healthcheck_antipatterns DC-4:dc_tmpfs_shadow DC-5:dc_cap_drop_all DC-6:dc_depends_on_deadlock DC-7:dc_resource_limits; do
+    for check in A:go_work B:shell_syntax C:python_packaging D:dockerfile_copy E:dockerfile_antipatterns F:secretref_ban G:deprecated_refs H:port_chain I:namespace_consistency DC-1:dc_env_multiline DC-2:dc_env_completeness DC-3:dc_healthcheck_antipatterns DC-4:dc_tmpfs_shadow DC-5:dc_cap_drop_all DC-6:dc_depends_on_deadlock DC-7:dc_resource_limits J:nextjs_rewrite_completeness FA-1:fastapi_exception_handler FA-2:fastapi_endpoint_try_except FA-3:api_path_literal_ban FA-4:ratelimit_retry_after ENV-1:env_placeholders SEC-1:secret_file_refs DEP-1:dep_lock_compat PY-1:python_duplicate_modules TEST-1:test_isolation; do
       local id="${check%%:*}" key="${check#*:}"
       local enabled=$(gk_config_enabled "$key")
       local sev=$(gk_config_value "${key}.severity" "critical")
